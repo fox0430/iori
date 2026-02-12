@@ -33,7 +33,8 @@ type
     future: Future[int32]
     kind: CompletionKind
     bufRef: seq[byte] # GC root for buffer
-    strRef: ref string # GC root for path string (ref ensures stable cstring through copies)
+    strRef: ref string
+      # GC root for path string (ref ensures stable cstring through copies)
     strRef2: ref string # GC root for second path string (rename)
     statxRef: ref Statx # GC root for statx output buffer
 
@@ -271,8 +272,7 @@ proc uringStatx*(
   sqe.off = cast[uint64](addr statxBuf[])
   sqe.opFlags = cast[uint32](flags)
 
-  var comp =
-    Completion(future: fut, kind: ckStatx, strRef: pathRef, statxRef: statxBuf)
+  var comp = Completion(future: fut, kind: ckStatx, strRef: pathRef, statxRef: statxBuf)
   return queueSqe(u, comp)
 
 proc uringRenameat*(
