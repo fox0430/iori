@@ -199,6 +199,32 @@ suite "uring_bridge":
 
     waitFor run()
 
+  test "path string survives after queueing (regression: dangling cstring)":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_dangling.txt"
+        defer:
+          removeFile(path)
+
+        let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fd >= 0
+        discard posix.close(fd)
+
+        # Queue statx without awaiting — SQE holds raw cstring pointer
+        var stx = new(Statx)
+        let fut = io.uringStatx(path, 0.cint, STATX_BASIC_STATS, stx)
+
+        # Allocate many strings to overwrite freed memory.
+        # If the cstring pointer was dangling, this makes the kernel read garbage.
+        var junk: seq[string]
+        for i in 0 ..< 1000:
+          junk.add("XXXXXXXXXXXXXXXXXXXXXXXXXXXX" & $i)
+
+        let res = await fut
+        doAssert res == 0, "statx failed with " & $res & " (expected 0)"
+
+    waitFor run()
+
   test "uringRenameat renames file":
     proc run() {.async.} =
       {.cast(gcsafe).}:
