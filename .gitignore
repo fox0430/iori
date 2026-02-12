@@ -1,3 +1,11 @@
 nimcache/
 nimblecache/
 htmldocs/
+
+tests/*
+!tests/*.*
+
+iori/*
+!iori/*.*
+
+iori.out
