@@ -1,0 +1,22 @@
+name: Format with nph
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/nph.yml'
+      - 'iori.nim*'
+      - 'iori/**'
+      - 'tests/**'
+
+jobs:
+  nph:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check `nph` formatting
+        uses: arnetheduck/nph-action@v1
+        with:
+          version: latest
+          options: "iori/ tests/ iori.nim iori.nimble"
+          fail: true
+          suggest: true
