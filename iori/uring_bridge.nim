@@ -33,8 +33,8 @@ type
     future: Future[int32]
     kind: CompletionKind
     bufRef: seq[byte] # GC root for buffer
-    strRef: string # GC root for path string
-    strRef2: string # GC root for second path string (rename)
+    strRef: ref string # GC root for path string (ref ensures stable cstring through copies)
+    strRef2: ref string # GC root for second path string (rename)
     statxRef: ref Statx # GC root for statx output buffer
 
   UringFileIO* = ref object
@@ -75,7 +75,7 @@ proc drainEventfd(u: UringFileIO) =
   let ret = read(u.eventFd, addr buf, sizeof(buf))
   if ret < 0:
     let err = errno
-    if err != EAGAIN:
+    if err != posix.EAGAIN:
       raiseOSError(OSErrorCode(err), "eventfd read failed")
 
 proc startPollLoop(u: UringFileIO) =
@@ -152,16 +152,18 @@ proc uringOpen*(
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
-  # Keep path alive until CQE arrives
-  let pathCopy = path
+  # Keep path alive until CQE arrives (ref string ensures stable cstring pointer)
+  var pathRef: ref string
+  new(pathRef)
+  pathRef[] = path
 
   sqe.opcode = IORING_OP_OPENAT
   sqe.fd = AT_FDCWD
-  sqe.`addr` = cast[uint64](pathCopy.cstring)
+  sqe.`addr` = cast[uint64](pathRef[].cstring)
   sqe.len = uint32(mode)
   sqe.opFlags = cast[uint32](flags)
 
-  var comp = Completion(future: fut, kind: ckOpen, strRef: pathCopy)
+  var comp = Completion(future: fut, kind: ckOpen, strRef: pathRef)
   return queueSqe(u, comp)
 
 proc uringRead*(
@@ -258,17 +260,19 @@ proc uringStatx*(
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
-  let pathCopy = path
+  var pathRef: ref string
+  new(pathRef)
+  pathRef[] = path
 
   sqe.opcode = IORING_OP_STATX
   sqe.fd = AT_FDCWD
-  sqe.`addr` = cast[uint64](pathCopy.cstring)
+  sqe.`addr` = cast[uint64](pathRef[].cstring)
   sqe.len = mask
   sqe.off = cast[uint64](addr statxBuf[])
   sqe.opFlags = cast[uint32](flags)
 
   var comp =
-    Completion(future: fut, kind: ckStatx, strRef: pathCopy, statxRef: statxBuf)
+    Completion(future: fut, kind: ckStatx, strRef: pathRef, statxRef: statxBuf)
   return queueSqe(u, comp)
 
 proc uringRenameat*(
@@ -282,18 +286,22 @@ proc uringRenameat*(
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
-  let oldPathCopy = oldPath
-  let newPathCopy = newPath
+  var oldPathRef: ref string
+  new(oldPathRef)
+  oldPathRef[] = oldPath
+  var newPathRef: ref string
+  new(newPathRef)
+  newPathRef[] = newPath
 
   sqe.opcode = IORING_OP_RENAMEAT
   sqe.fd = AT_FDCWD
-  sqe.`addr` = cast[uint64](oldPathCopy.cstring)
+  sqe.`addr` = cast[uint64](oldPathRef[].cstring)
   sqe.len = cast[uint32](AT_FDCWD)
-  sqe.off = cast[uint64](newPathCopy.cstring)
+  sqe.off = cast[uint64](newPathRef[].cstring)
   sqe.opFlags = flags
 
   var comp =
-    Completion(future: fut, kind: ckRename, strRef: oldPathCopy, strRef2: newPathCopy)
+    Completion(future: fut, kind: ckRename, strRef: oldPathRef, strRef2: newPathRef)
   return queueSqe(u, comp)
 
 # Lifecycle
