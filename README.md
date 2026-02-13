@@ -10,9 +10,17 @@ Async file I/O library in Nim using io_uring.
 - Nim >= 2.0.2
 - Linux 5.6+ (6.1+ recommended)
 
+## Install
+
+```bash
+nimble install iori
+```
+
 ## Usage
 
 ```nim
+# example.nim
+
 import pkg/iori
 
 proc main() {.async.} =
@@ -37,6 +45,7 @@ Compile with an async backend:
 nim c -d:asyncBackend=asyncdispatch -r example.nim
 
 # Use Chronos
+nimble install chronos
 nim c -d:asyncBackend=chronos -r example.nim
 ```
 
