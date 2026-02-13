@@ -81,15 +81,11 @@ template awaitMaybeTimeout(
     await awaitOrTimeout(u, fut, deadline, op)
 
 proc readFile*(
-    u: UringFileIO, path: string, maxSize: int = 1048576, timeoutMs: int = 0
+    u: UringFileIO, path: string, timeoutMs: int = 0
 ): Future[seq[byte]] {.async.} =
   ## Read entire file contents. Uses statx to determine file size, then reads
-  ## in a loop to handle partial reads. Raises IOError if file size exceeds maxSize.
-  ## maxSize must not exceed uint32 range (~4GiB).
+  ## in a loop to handle partial reads.
   ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
-  if maxSize > int(high(uint32)):
-    raise newException(IOError, "maxSize exceeds 4GiB limit")
-
   let deadline =
     if timeoutMs > 0:
       getMonoTime() + initDuration(milliseconds = timeoutMs)
@@ -111,10 +107,6 @@ proc readFile*(
     )
     raiseOnError(statxRes, Operation.statx)
     let fileSize = int(stx.stxSize)
-
-    if fileSize > maxSize:
-      raise
-        newException(IOError, "file size " & $fileSize & " exceeds maxSize " & $maxSize)
 
     if fileSize <= 0:
       closed = true
@@ -219,11 +211,11 @@ proc writeFile*(
       discard await uringClose(u, fd.cint)
 
 proc readFileString*(
-    u: UringFileIO, path: string, maxSize: int = 1048576, timeoutMs: int = 0
+    u: UringFileIO, path: string, timeoutMs: int = 0
 ): Future[string] {.async.} =
   ## Read entire file as string. Raises IOError on failure.
   ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
-  let bytes = await readFile(u, path, maxSize, timeoutMs)
+  let bytes = await readFile(u, path, timeoutMs)
   var s = newString(bytes.len)
   if bytes.len > 0:
     copyMem(addr s[0], unsafeAddr bytes[0], bytes.len)
