@@ -131,7 +131,7 @@ proc startPollLoop(u: UringFileIO) {.raises: [OSError].} =
   try:
     registerFdReader(
       u.eventFd,
-      proc() {.gcsafe, raises: [].} =
+      proc() {.raises: [].} =
         if u.closed:
           return
         try:
@@ -183,7 +183,7 @@ proc queueSqe(u: UringFileIO, comp: Completion): Future[int32] =
   if not u.flushScheduled:
     u.flushScheduled = true
     scheduleSoon(
-      proc() {.gcsafe, raises: [].} =
+      proc() {.raises: [].} =
         u.flush()
     )
 
