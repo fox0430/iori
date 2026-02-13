@@ -1,8 +1,11 @@
 ## Tests for uring_file_io: High-level file I/O API.
 
-import std/[unittest, os, posix]
+import std/[unittest, os, posix, importutils, monotimes, times]
 
 import ../iori/uring_file_io
+import ../iori/uring_raw
+
+privateAccess(UringFileIO)
 
 suite "uring_file_io":
   var io {.threadvar.}: UringFileIO
@@ -258,5 +261,169 @@ suite "uring_file_io":
             discard await fut
           except IOError:
             discard
+
+    waitFor run()
+
+  test "CancelledError is distinct from IOError":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # CancelledError must not be caught by except IOError
+        var caughtCancel = false
+        var caughtIO = false
+        try:
+          raise (ref CancelledError)(msg: "test")
+        except IOError:
+          caughtIO = true
+        except CancelledError:
+          caughtCancel = true
+        doAssert caughtCancel
+        doAssert not caughtIO
+
+    waitFor run()
+
+  test "submit failure in readFile raises IOError not CancelledError":
+    var io2 = newUringFileIO(32)
+    defer:
+      io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_cancel_read.txt"
+        defer:
+          removeFile(path)
+
+        # Create file so path exists
+        let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fd >= 0
+        discard posix.close(fd)
+
+        # Queue readFile — it starts with statx, which becomes unsubmitted
+        let readFileFut = io2.readFile(path)
+
+        # Sabotage ring fd to force submit failure, then flush
+        let savedFd = io2.ring.ringFd
+        io2.ring.ringFd = -1
+        io2.flush()
+        io2.ring.ringFd = savedFd
+
+        # Submit failure is IOError, not CancelledError
+        var caughtIO = false
+        try:
+          discard await readFileFut
+        except CancelledError:
+          doAssert false, "should not be CancelledError"
+        except IOError:
+          caughtIO = true
+        doAssert caughtIO
+
+    waitFor run()
+
+  test "readFile with timeout succeeds for normal file":
+    let path = getTempDir() / "iori_test_timeout_read.bin"
+    defer:
+      removeFile(path)
+
+    let data = @[byte 1, 2, 3, 4, 5]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        await io.writeFile(path, data)
+        let result = await io.readFile(path, 4096, timeoutMs = 5000)
+        doAssert result == data
+
+    waitFor run()
+
+  test "writeFile with timeout succeeds for normal file":
+    let path = getTempDir() / "iori_test_timeout_write.bin"
+    defer:
+      removeFile(path)
+
+    let data = @[byte 10, 20, 30]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        await io.writeFile(path, data, timeoutMs = 5000)
+        let result = await io.readFile(path, 4096)
+        doAssert result == data
+
+    waitFor run()
+
+  test "readFileString with timeout succeeds":
+    let path = getTempDir() / "iori_test_timeout_readstr.txt"
+    defer:
+      removeFile(path)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        await io.writeFileString(path, "timeout test")
+        let result = await io.readFileString(path, 4096, timeoutMs = 5000)
+        doAssert result == "timeout test"
+
+    waitFor run()
+
+  test "writeFileString with timeout succeeds":
+    let path = getTempDir() / "iori_test_timeout_writestr.txt"
+    defer:
+      removeFile(path)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        await io.writeFileString(path, "timeout test", timeoutMs = 5000)
+        let result = await io.readFileString(path, 4096)
+        doAssert result == "timeout test"
+
+    waitFor run()
+
+  test "TimeoutError is distinct from IOError and CancelledError":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var caughtTimeout = false
+        var caughtIO = false
+        var caughtCancel = false
+        try:
+          raise newException(TimeoutError, "test")
+        except IOError:
+          caughtIO = true
+        except CancelledError:
+          caughtCancel = true
+        except TimeoutError:
+          caughtTimeout = true
+        doAssert caughtTimeout
+        doAssert not caughtIO
+        doAssert not caughtCancel
+
+    waitFor run()
+
+  test "timer + cancel pattern cancels blocked bridge read":
+    ## Tests the timeout mechanism primitives: sleepMsAsync timer fires,
+    ## uringCancel cancels the blocked kernel operation, read gets -ECANCELED.
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var fds: array[2, cint]
+        doAssert pipe(fds) == 0
+        let readFd = fds[0]
+        let writeFd = fds[1]
+        defer:
+          discard posix.close(readFd)
+          discard posix.close(writeFd)
+
+        var buf = newSeq[byte](64)
+        let readFut = io.uringRead(readFd, addr buf[0], 64, 0'u64, buf)
+        io.flush()
+
+        # Manually replicate the awaitOrTimeout pattern
+        let deadline = getMonoTime() + initDuration(milliseconds = 100)
+        let remaining = deadline - getMonoTime()
+        let timer = sleepMsAsync(int(remaining.inMilliseconds))
+        await readFut or timer
+        doAssert not readFut.finished, "read should still be blocked on empty pipe"
+
+        # Cancel and drain
+        try:
+          discard await io.uringCancel(readFut)
+        except IOError:
+          discard
+        let readRes = await readFut
+        doAssert readRes == -125, "read should be -ECANCELED: " & $readRes
 
     waitFor run()

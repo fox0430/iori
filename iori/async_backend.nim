@@ -13,9 +13,21 @@ const hasAsyncDispatch* = asyncBackend == "asyncdispatch"
 const hasChronos* = asyncBackend == "chronos"
   ## `true` when the chronos backend is selected.
 
+type TimeoutError* = object of CatchableError
+  ## Raised when an async operation times out.
+
 when hasChronos:
   import chronos
   export chronos
+
+  proc sleepMsAsync*(ms: int): Future[void] =
+    ## Sleep for `ms` milliseconds. Wrapper around chronos Duration-based API.
+    sleepAsync(milliseconds(ms))
+
+  proc cancelTimer*(fut: Future[void]) =
+    ## Cancel a pending timer future to prevent future tracking warnings.
+    if not fut.finished():
+      fut.cancelSoon()
 
   proc registerFdReader*(fd: cint, cb: proc() {.gcsafe, raises: [].}) =
     ## Register a file descriptor for read-readiness notifications on the event loop.
@@ -52,6 +64,17 @@ when hasChronos:
 elif hasAsyncDispatch:
   import std/asyncdispatch
   export asyncdispatch
+
+  type CancelledError* = object of CatchableError
+    ## Raised when an async operation is cancelled.
+
+  proc sleepMsAsync*(ms: int): Future[void] =
+    ## Sleep for `ms` milliseconds.
+    sleepAsync(ms)
+
+  proc cancelTimer*(fut: Future[void]) =
+    ## No-op: asyncdispatch timers complete harmlessly and are GC'd.
+    discard
 
   proc registerFdReader*(fd: cint, cb: proc() {.gcsafe, raises: [].}) =
     ## Register a file descriptor for read-readiness notifications on the event loop.
