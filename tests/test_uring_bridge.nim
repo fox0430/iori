@@ -1,9 +1,11 @@
 ## Tests for uring_bridge: Low-level API and lifecycle.
 
-import std/[unittest, os, posix, strutils]
+import std/[unittest, os, posix, strutils, importutils]
 
 import ../iori/uring_bridge
 import ../iori/uring_raw
+
+privateAccess(UringFileIO)
 
 suite "uring_bridge":
   var io {.threadvar.}: UringFileIO
@@ -271,6 +273,77 @@ suite "uring_bridge":
         var buf = newSeq[byte](64)
         let readRes = await io.uringRead(fdRes.cint, addr buf[0], 64, 0'u64, buf)
         doAssert readRes == -9 # -EBADF
+
+    waitFor run()
+
+  test "API calls after close fail with IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # All low-level API procs should fail immediately on a closed instance.
+        var raised = false
+        try:
+          discard await io2.uringOpen("/dev/null", O_RDONLY, 0)
+        except IOError:
+          raised = true
+        doAssert raised
+
+        raised = false
+        var buf = newSeq[byte](64)
+        try:
+          discard await io2.uringRead(0.cint, addr buf[0], 64, 0'u64, buf)
+        except IOError:
+          raised = true
+        doAssert raised
+
+        raised = false
+        try:
+          discard await io2.uringClose(0.cint)
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "error field propagates to pending futures on close":
+    var io2 = newUringFileIO(32)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # Queue an operation but don't await yet
+        let fut = io2.uringOpen("/dev/null", O_RDONLY, 0)
+
+        # Set error reason and close
+        let reason = newException(OSError, "test error reason")
+        io2.error = reason
+        io2.close()
+
+        var caught: ref CatchableError
+        try:
+          discard await fut
+        except CatchableError as e:
+          caught = e
+        doAssert caught != nil
+        doAssert caught == reason
+
+    waitFor run()
+
+  test "error field propagates to API calls after close":
+    var io2 = newUringFileIO(32)
+    let reason = newException(OSError, "injected error")
+    io2.error = reason
+    io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var caught: ref CatchableError
+        try:
+          discard await io2.uringOpen("/dev/null", O_RDONLY, 0)
+        except CatchableError as e:
+          caught = e
+        doAssert caught == reason
 
     waitFor run()
 
