@@ -188,7 +188,7 @@ suite "uring_raw":
 
     let ret2 = read(efd, addr buf, sizeof(buf))
     check ret2 < 0 # EAGAIN — no signal
-    check errno == EAGAIN
+    check errno == posix.EAGAIN
 
     let cqe2 = peekCqe(ring)
     check cqe2 != nil
