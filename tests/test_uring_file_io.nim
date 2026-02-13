@@ -328,8 +328,8 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFile(path, data)
-        let result = await io.readFile(path, 4096, timeoutMs = 5000)
-        doAssert result == data
+        let r = await io.readFile(path, 4096, timeoutMs = 5000)
+        doAssert r == data
 
     waitFor run()
 
@@ -343,8 +343,8 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFile(path, data, timeoutMs = 5000)
-        let result = await io.readFile(path, 4096)
-        doAssert result == data
+        let r = await io.readFile(path, 4096)
+        doAssert r == data
 
     waitFor run()
 
@@ -356,8 +356,8 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFileString(path, "timeout test")
-        let result = await io.readFileString(path, 4096, timeoutMs = 5000)
-        doAssert result == "timeout test"
+        let r = await io.readFileString(path, 4096, timeoutMs = 5000)
+        doAssert r == "timeout test"
 
     waitFor run()
 
@@ -369,8 +369,8 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFileString(path, "timeout test", timeoutMs = 5000)
-        let result = await io.readFileString(path, 4096)
-        doAssert result == "timeout test"
+        let r = await io.readFileString(path, 4096)
+        doAssert r == "timeout test"
 
     waitFor run()
 
@@ -425,5 +425,64 @@ suite "uring_file_io":
           discard
         let readRes = await readFut
         doAssert readRes == -125, "read should be -ECANCELED: " & $readRes
+
+    waitFor run()
+
+  test "writeFile on FIFO with timeout raises TimeoutError":
+    ## Writing to a FIFO with no reader blocks. Tests that the shared deadline
+    ## across all sub-operations (open, write, fsync, close) triggers TimeoutError.
+    let path = getTempDir() / "iori_test_fifo_write_timeout"
+    defer:
+      removeFile(path)
+
+    doAssert mkfifo(path.cstring, 0o644) == 0
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var raised = false
+        try:
+          await io.writeFile(path, @[byte 1, 2, 3], timeoutMs = 100)
+        except TimeoutError:
+          raised = true
+        doAssert raised, "should have raised TimeoutError"
+
+    waitFor run()
+
+  test "readFile on unreadable file with timeout raises IOError":
+    ## statx succeeds (file exists, size > 0) but open fails with EACCES.
+    ## IOError must be raised — the timeout wrapper on uringOpen must not mask it.
+    let path = getTempDir() / "iori_test_unreadable.bin"
+    defer:
+      discard chmod(path.cstring, 0o644)
+      removeFile(path)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        await io.writeFile(path, @[byte 1, 2, 3])
+        discard chmod(path.cstring, 0o000)
+        var caughtIO = false
+        try:
+          discard await io.readFile(path, timeoutMs = 5000)
+        except TimeoutError:
+          doAssert false, "should not be TimeoutError"
+        except IOError:
+          caughtIO = true
+        doAssert caughtIO
+
+    waitFor run()
+
+  test "writeFile to read-only path with timeout raises IOError":
+    ## When open fails immediately (EACCES), IOError must be raised even with
+    ## a timeout set — the timeout wrapper must not mask the error.
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var caughtIO = false
+        try:
+          await io.writeFile("/proc/nonexistent_iori_test", @[byte 1], timeoutMs = 5000)
+        except TimeoutError:
+          doAssert false, "should not be TimeoutError"
+        except IOError:
+          caughtIO = true
+        doAssert caughtIO
 
     waitFor run()
