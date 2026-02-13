@@ -184,8 +184,7 @@ proc queueSqe(u: UringFileIO, comp: Completion): Future[int32] =
     u.flushScheduled = true
     scheduleSoon(
       proc() {.gcsafe, raises: [].} =
-        {.cast(gcsafe).}:
-          u.flush()
+        u.flush()
     )
 
   return fut
