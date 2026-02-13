@@ -10,17 +10,25 @@ import ./uring_raw
 
 export uring_bridge
 
+type Operation = enum
+  close = "close"
+  fsync = "fsync"
+  open = "open"
+  read = "read"
+  statx = "statx"
+  write = "write"
+
 const ECANCELED = 125'i32
 
-template raiseOnError(res: int32, op: string) =
+template raiseOnError(res: int32, op: Operation) =
   ## Raise CancelledError for -ECANCELED, IOError for other negative results.
   if res < 0:
     if res == -ECANCELED:
-      raise (ref CancelledError)(msg: op & " cancelled")
-    raise newException(IOError, op & " failed: " & osErrorMsg(OSErrorCode(-res)))
+      raise (ref CancelledError)(msg: $op & " cancelled")
+    raise newException(IOError, $op & " failed: " & osErrorMsg(OSErrorCode(-res)))
 
 proc awaitOrTimeout(
-    u: UringFileIO, fut: Future[int32], deadline: MonoTime, op: string
+    u: UringFileIO, fut: Future[int32], deadline: MonoTime, op: Operation
 ): Future[int32] {.async.} =
   ## Await a bridge-level Future with a deadline. If the deadline passes before
   ## `fut` completes, cancel the underlying io_uring operation and raise TimeoutError.
@@ -40,7 +48,7 @@ proc awaitOrTimeout(
         discard await fut
       except CatchableError:
         discard
-    raise newException(TimeoutError, op & " timed out")
+    raise newException(TimeoutError, $op & " timed out")
 
   let timer = sleepMsAsync(int(ms))
   await fut or timer
@@ -61,10 +69,10 @@ proc awaitOrTimeout(
         discard await fut
       except CatchableError:
         discard
-    raise newException(TimeoutError, op & " timed out")
+    raise newException(TimeoutError, $op & " timed out")
 
 template awaitMaybeTimeout(
-    u: UringFileIO, fut: untyped, deadline: MonoTime, op: string
+    u: UringFileIO, fut: untyped, deadline: MonoTime, op: Operation
 ): untyped =
   ## If deadline is default (zero), plain await. Otherwise await with timeout.
   if deadline == default(MonoTime):
@@ -91,9 +99,9 @@ proc readFile*(
   # statx to get file size
   var stx = new(Statx)
   let statxRes = awaitMaybeTimeout(
-    u, uringStatx(u, path, 0.cint, STATX_SIZE, stx), deadline, "statx"
+    u, uringStatx(u, path, 0.cint, STATX_SIZE, stx), deadline, Operation.statx
   )
-  raiseOnError(statxRes, "statx")
+  raiseOnError(statxRes, Operation.statx)
   let fileSize = int(stx.stxSize)
 
   if fileSize > maxSize:
@@ -103,8 +111,9 @@ proc readFile*(
   if fileSize <= 0:
     return @[]
 
-  let fdRes = await uringOpen(u, path, O_RDONLY, 0)
-  raiseOnError(fdRes, "open")
+  let fdRes =
+    awaitMaybeTimeout(u, uringOpen(u, path, O_RDONLY, 0), deadline, Operation.open)
+  raiseOnError(fdRes, Operation.open)
   let fd = fdRes
 
   var closed = false
@@ -119,20 +128,20 @@ proc readFile*(
           u, fd.cint, addr buf[totalRead], uint32(remaining), uint64(totalRead), buf
         ),
         deadline,
-        "read",
+        Operation.read,
       )
       if readRes <= 0:
         closed = true
         let closeRes = await uringClose(u, fd.cint)
-        raiseOnError(readRes, "read")
-        raiseOnError(closeRes, "close")
+        raiseOnError(readRes, Operation.read)
+        raiseOnError(closeRes, Operation.close)
         buf.setLen(totalRead)
         return buf
       totalRead += readRes.int
 
     closed = true
     let closeRes = await uringClose(u, fd.cint)
-    raiseOnError(closeRes, "close")
+    raiseOnError(closeRes, Operation.close)
 
     buf.setLen(totalRead)
     return buf
@@ -152,8 +161,10 @@ proc writeFile*(
       default(MonoTime)
 
   let flags = O_WRONLY or O_CREAT or O_TRUNC
-  let fdRes = await uringOpen(u, path, flags.cint, 0o644)
-  raiseOnError(fdRes, "open")
+  let fdRes = awaitMaybeTimeout(
+    u, uringOpen(u, path, flags.cint, 0o644), deadline, Operation.open
+  )
+  raiseOnError(fdRes, Operation.open)
   let fd = fdRes
 
   var closed = false
@@ -174,24 +185,25 @@ proc writeFile*(
             dataCopy,
           ),
           deadline,
-          "write",
+          Operation.write,
         )
         if writeRes <= 0:
           closed = true
           discard await uringClose(u, fd.cint)
-          raiseOnError(writeRes, "write")
+          raiseOnError(writeRes, Operation.write)
           raise newException(IOError, "write stalled: 0 bytes written")
         written += writeRes.int
 
-    let fsyncRes = awaitMaybeTimeout(u, uringFsync(u, fd.cint), deadline, "fsync")
+    let fsyncRes =
+      awaitMaybeTimeout(u, uringFsync(u, fd.cint), deadline, Operation.fsync)
     if fsyncRes < 0:
       closed = true
       discard await uringClose(u, fd.cint)
-      raiseOnError(fsyncRes, "fsync")
+      raiseOnError(fsyncRes, Operation.fsync)
 
     closed = true
     let closeRes = await uringClose(u, fd.cint)
-    raiseOnError(closeRes, "close")
+    raiseOnError(closeRes, Operation.close)
   finally:
     if not closed:
       discard await uringClose(u, fd.cint)
