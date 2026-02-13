@@ -154,9 +154,14 @@ proc readFile*(
       discard await uringClose(u, fd.cint)
 
 proc writeFile*(
-    u: UringFileIO, path: string, data: seq[byte], timeoutMs: int = 0
+    u: UringFileIO,
+    path: string,
+    data: seq[byte],
+    timeoutMs: int = 0,
+    fsync: bool = true,
 ): Future[void] {.async.} =
   ## Write data to file. Creates/truncates file. Raises IOError on failure.
+  ## If fsync is false, skip the fsync call after writing.
   ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
   let deadline =
     if timeoutMs > 0:
@@ -198,12 +203,13 @@ proc writeFile*(
           raise newException(IOError, "write stalled: 0 bytes written")
         written += writeRes.int
 
-    let fsyncRes =
-      awaitMaybeTimeout(u, uringFsync(u, fd.cint), deadline, Operation.fsync)
-    if fsyncRes < 0:
-      closed = true
-      discard await uringClose(u, fd.cint)
-      raiseOnError(fsyncRes, Operation.fsync)
+    if fsync:
+      let fsyncRes =
+        awaitMaybeTimeout(u, uringFsync(u, fd.cint), deadline, Operation.fsync)
+      if fsyncRes < 0:
+        closed = true
+        discard await uringClose(u, fd.cint)
+        raiseOnError(fsyncRes, Operation.fsync)
 
     closed = true
     let closeRes = await uringClose(u, fd.cint)
@@ -224,11 +230,12 @@ proc readFileString*(
   return s
 
 proc writeFileString*(
-    u: UringFileIO, path: string, data: string, timeoutMs: int = 0
+    u: UringFileIO, path: string, data: string, timeoutMs: int = 0, fsync: bool = true
 ): Future[void] {.async.} =
   ## Write string to file. Creates/truncates file. Raises IOError on failure.
+  ## If fsync is false, skip the fsync call after writing.
   ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
   var bytes = newSeq[byte](data.len)
   if data.len > 0:
     copyMem(addr bytes[0], unsafeAddr data[0], data.len)
-  await writeFile(u, path, bytes, timeoutMs)
+  await writeFile(u, path, bytes, timeoutMs, fsync)

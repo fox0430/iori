@@ -204,6 +204,34 @@ suite "uring_file_io":
 
     waitFor run()
 
+  test "writeFile with fsync=false skips fsync":
+    let path = getTempDir() / "iori_test_no_fsync.bin"
+    defer:
+      removeFile(path)
+
+    let data = @[byte 1, 2, 3, 4, 5]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        await io.writeFile(path, data, fsync = false)
+        let readResult = await io.readFile(path, 4096)
+        doAssert readResult == data
+
+    waitFor run()
+
+  test "writeFileString with fsync=false skips fsync":
+    let path = getTempDir() / "iori_test_no_fsync.txt"
+    defer:
+      removeFile(path)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        await io.writeFileString(path, "no fsync test", fsync = false)
+        let readResult = await io.readFileString(path, 4096)
+        doAssert readResult == "no fsync test"
+
+    waitFor run()
+
   test "readFile with maxSize > uint32 max raises IOError":
     proc run() {.async.} =
       {.cast(gcsafe).}:
