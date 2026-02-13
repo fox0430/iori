@@ -46,6 +46,7 @@ type
     nextId: uint64
     pending: Table[uint64, Completion]
     closed: bool
+    error: ref CatchableError # Propagated to pending futures
     selfRef: UringFileIO # GC root: prevents collection while poll loop holds raw pointer
     flushScheduled: bool # Prevents duplicate callSoon scheduling
     unsubmitted: seq[uint64] # IDs not yet submitted (for failing on submit error)
@@ -54,6 +55,14 @@ proc allocId(u: UringFileIO): uint64 =
   ## ID allocation
   result = u.nextId
   u.nextId += 1
+
+proc stopPollLoop(u: UringFileIO) {.raises: [].} =
+  try:
+    unregisterFdReader(u.eventFd)
+  except CatchableError as e:
+    if u.error == nil:
+      u.error = e
+  u.selfRef = nil
 
 proc processCqes(u: UringFileIO) {.raises: [].} =
   ## CQE processing
@@ -72,13 +81,45 @@ proc processCqes(u: UringFileIO) {.raises: [].} =
       {.cast(raises: []).}:
         comp.future.complete(res)
 
+proc close*(u: UringFileIO) {.raises: [].} =
+  ## Close the UringFileIO instance. Fails all pending futures and releases resources.
+  ## If `u.error` is set, pending futures are failed with that error.
+  if u.closed:
+    return
+  u.closed = true
+
+  stopPollLoop(u)
+  u.flushScheduled = false
+  u.unsubmitted.setLen(0)
+
+  let err =
+    if u.error != nil:
+      u.error
+    else:
+      newException(IOError, "UringFileIO closed")
+
+  # Collect and clear pending before failing — fail() may trigger callbacks
+  # that attempt to modify the table.
+  var pending: seq[Completion]
+  for id, comp in u.pending:
+    pending.add(comp)
+  u.pending.clear()
+  for comp in pending:
+    {.cast(raises: []).}:
+      comp.future.fail(err)
+
+  unregisterEventfd(u.ring)
+  discard close(u.eventFd)
+  u.eventFd = -1
+  closeRing(u.ring)
+
 proc drainEventfd(u: UringFileIO) =
   ## Read and discard the eventfd counter. Ignores EAGAIN.
   var buf: uint64
   let ret = read(u.eventFd, addr buf, sizeof(buf))
   if ret < 0:
     let err = errno
-    if err != posix.EAGAIN:
+    if err != posix.EAGAIN and err != posix.EINTR:
       raiseOSError(OSErrorCode(err), "eventfd read failed")
 
 proc startPollLoop(u: UringFileIO) {.raises: [OSError].} =
@@ -91,19 +132,14 @@ proc startPollLoop(u: UringFileIO) {.raises: [OSError].} =
           return
         try:
           u.drainEventfd()
-        except OSError:
-          discard
+        except OSError as e:
+          u.error = e
+          u.close()
         u.processCqes(),
     )
   except CatchableError as e:
+    u.selfRef = nil
     raise (ref OSError)(msg: "eventfd registration failed: " & e.msg)
-
-proc stopPollLoop(u: UringFileIO) {.raises: [].} =
-  try:
-    unregisterFdReader(u.eventFd)
-  except CatchableError:
-    discard
-  u.selfRef = nil
 
 proc flush*(u: UringFileIO) {.raises: [].} =
   ## Flush all queued SQEs to the kernel in a single io_uring_enter syscall.
@@ -148,13 +184,20 @@ proc queueSqe(u: UringFileIO, comp: Completion): Future[int32] =
 
   return fut
 
-# Low-level API
-
 proc uringOpen*(
     u: UringFileIO, path: string, flags: cint, mode: uint32 = 0o644
 ): Future[int32] =
   ## Submit OPENAT operation. Returns Future with fd on success or negative errno.
   let fut = newFuture[int32]("uringOpen")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
@@ -187,6 +230,15 @@ proc uringRead*(
   ## bufRef keeps the buffer GC-rooted until completion.
   let fut = newFuture[int32]("uringRead")
 
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
   let sqe = getSqe(u.ring)
   if sqe == nil:
     fut.fail(newException(IOError, "io_uring SQ full"))
@@ -213,6 +265,15 @@ proc uringWrite*(
   ## bufRef keeps the buffer GC-rooted until completion.
   let fut = newFuture[int32]("uringWrite")
 
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
   let sqe = getSqe(u.ring)
   if sqe == nil:
     fut.fail(newException(IOError, "io_uring SQ full"))
@@ -231,6 +292,15 @@ proc uringFsync*(u: UringFileIO, fd: cint): Future[int32] =
   ## Submit FSYNC operation. Returns Future with 0 on success or negative errno.
   let fut = newFuture[int32]("uringFsync")
 
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
   let sqe = getSqe(u.ring)
   if sqe == nil:
     fut.fail(newException(IOError, "io_uring SQ full"))
@@ -245,6 +315,15 @@ proc uringFsync*(u: UringFileIO, fd: cint): Future[int32] =
 proc uringClose*(u: UringFileIO, fd: cint): Future[int32] =
   ## Submit CLOSE operation. Returns Future with 0 on success or negative errno.
   let fut = newFuture[int32]("uringClose")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
@@ -263,6 +342,15 @@ proc uringStatx*(
   ## Submit STATX operation. Returns Future with 0 on success or negative errno.
   ## Results are written to statxBuf.
   let fut = newFuture[int32]("uringStatx")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
@@ -289,6 +377,15 @@ proc uringRenameat*(
   ## Submit RENAMEAT operation. Returns Future with 0 on success or negative errno.
   let fut = newFuture[int32]("uringRenameat")
 
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
   let sqe = getSqe(u.ring)
   if sqe == nil:
     fut.fail(newException(IOError, "io_uring SQ full"))
@@ -311,8 +408,6 @@ proc uringRenameat*(
   var comp =
     Completion(future: fut, kind: ckRename, strRef: oldPathRef, strRef2: newPathRef)
   return queueSqe(u, comp)
-
-# Lifecycle
 
 proc newUringFileIO*(entries: uint32 = 256): UringFileIO {.raises: [OSError].} =
   ## Create a new UringFileIO instance. Initializes io_uring and starts poll loop.
@@ -344,28 +439,3 @@ proc newUringFileIO*(entries: uint32 = 256): UringFileIO {.raises: [OSError].} =
     discard close(efd)
     closeRing(ring)
     raise e
-
-proc close*(u: UringFileIO) {.raises: [].} =
-  ## Close the UringFileIO instance. Fails all pending futures and releases resources.
-  if u.closed:
-    return
-  u.closed = true
-
-  stopPollLoop(u)
-  u.flushScheduled = false
-  u.unsubmitted.setLen(0)
-
-  # Collect and clear pending before failing — fail() may trigger callbacks
-  # that attempt to modify the table.
-  var pending: seq[Completion]
-  for id, comp in u.pending:
-    pending.add(comp)
-  u.pending.clear()
-  for comp in pending:
-    {.cast(raises: []).}:
-      comp.future.fail(newException(IOError, "UringFileIO closed"))
-
-  unregisterEventfd(u.ring)
-  discard close(u.eventFd)
-  u.eventFd = -1
-  closeRing(u.ring)

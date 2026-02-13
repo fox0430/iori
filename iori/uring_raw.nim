@@ -444,6 +444,13 @@ proc submit*(ring: var IoUring, waitNr: uint32 = 0): cint =
   result =
     ioUringEnter(ring.ringFd, cuint(toSubmit), cuint(waitNr), cuint(flags), nil, 0)
 
+  if result < 0 and toSubmit > 0:
+    # io_uring_enter failure with negative return guarantees 0 SQEs consumed.
+    # Roll back so zombie SQEs are invisible to kernel and slots are reusable.
+    # NOTE: Safe only in non-SQPOLL mode (kernel reads SQ ring only during io_uring_enter).
+    atomicStoreRelease(ring.sqTail, prevTail)
+    ring.sqLocalTail = prevTail
+
 proc peekCqe*(ring: var IoUring): ptr IoUringCqe =
   ## Peek at the next completed CQE. Returns nil if none available.
   let head = ring.cqHead[]
