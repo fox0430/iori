@@ -38,30 +38,38 @@ proc readFile*(
     raise newException(IOError, "open failed: " & osErrorMsg(OSErrorCode(-fdRes)))
   let fd = fdRes
 
-  var buf = newSeq[byte](fileSize)
-  var totalRead = 0
-  while totalRead < fileSize:
-    let remaining = min(fileSize - totalRead, int(high(uint32)))
-    let readRes = await uringRead(
-      u, fd.cint, addr buf[totalRead], uint32(remaining), uint64(totalRead), buf
-    )
-    if readRes <= 0:
-      let closeRes = await uringClose(u, fd.cint)
-      if readRes < 0:
-        raise newException(IOError, "read failed: " & osErrorMsg(OSErrorCode(-readRes)))
-      if closeRes < 0:
-        raise
-          newException(IOError, "close failed: " & osErrorMsg(OSErrorCode(-closeRes)))
-      buf.setLen(totalRead)
-      return buf
-    totalRead += readRes.int
+  var closed = false
+  try:
+    var buf = newSeq[byte](fileSize)
+    var totalRead = 0
+    while totalRead < fileSize:
+      let remaining = min(fileSize - totalRead, int(high(uint32)))
+      let readRes = await uringRead(
+        u, fd.cint, addr buf[totalRead], uint32(remaining), uint64(totalRead), buf
+      )
+      if readRes <= 0:
+        closed = true
+        let closeRes = await uringClose(u, fd.cint)
+        if readRes < 0:
+          raise
+            newException(IOError, "read failed: " & osErrorMsg(OSErrorCode(-readRes)))
+        if closeRes < 0:
+          raise
+            newException(IOError, "close failed: " & osErrorMsg(OSErrorCode(-closeRes)))
+        buf.setLen(totalRead)
+        return buf
+      totalRead += readRes.int
 
-  let closeRes = await uringClose(u, fd.cint)
-  if closeRes < 0:
-    raise newException(IOError, "close failed: " & osErrorMsg(OSErrorCode(-closeRes)))
+    closed = true
+    let closeRes = await uringClose(u, fd.cint)
+    if closeRes < 0:
+      raise newException(IOError, "close failed: " & osErrorMsg(OSErrorCode(-closeRes)))
 
-  buf.setLen(totalRead)
-  return buf
+    buf.setLen(totalRead)
+    return buf
+  finally:
+    if not closed:
+      discard await uringClose(u, fd.cint)
 
 proc writeFile*(u: UringFileIO, path: string, data: seq[byte]): Future[void] {.async.} =
   ## Write data to file. Creates/truncates file. Raises IOError on failure.
@@ -71,31 +79,45 @@ proc writeFile*(u: UringFileIO, path: string, data: seq[byte]): Future[void] {.a
     raise newException(IOError, "open failed: " & osErrorMsg(OSErrorCode(-fdRes)))
   let fd = fdRes
 
-  if data.len > 0:
-    var dataCopy = data
-    var written = 0
-    while written < dataCopy.len:
-      let remaining = min(dataCopy.len - written, int(high(uint32)))
-      let writeRes = await uringWrite(
-        u, fd.cint, addr dataCopy[written], uint32(remaining), uint64(written), dataCopy
-      )
-      if writeRes <= 0:
-        discard await uringClose(u, fd.cint)
-        if writeRes < 0:
-          raise
-            newException(IOError, "write failed: " & osErrorMsg(OSErrorCode(-writeRes)))
-        else:
-          raise newException(IOError, "write stalled: 0 bytes written")
-      written += writeRes.int
+  var closed = false
+  try:
+    if data.len > 0:
+      var dataCopy = data
+      var written = 0
+      while written < dataCopy.len:
+        let remaining = min(dataCopy.len - written, int(high(uint32)))
+        let writeRes = await uringWrite(
+          u,
+          fd.cint,
+          addr dataCopy[written],
+          uint32(remaining),
+          uint64(written),
+          dataCopy,
+        )
+        if writeRes <= 0:
+          closed = true
+          discard await uringClose(u, fd.cint)
+          if writeRes < 0:
+            raise newException(
+              IOError, "write failed: " & osErrorMsg(OSErrorCode(-writeRes))
+            )
+          else:
+            raise newException(IOError, "write stalled: 0 bytes written")
+        written += writeRes.int
 
-  let fsyncRes = await uringFsync(u, fd.cint)
-  if fsyncRes < 0:
-    discard await uringClose(u, fd.cint)
-    raise newException(IOError, "fsync failed: " & osErrorMsg(OSErrorCode(-fsyncRes)))
+    let fsyncRes = await uringFsync(u, fd.cint)
+    if fsyncRes < 0:
+      closed = true
+      discard await uringClose(u, fd.cint)
+      raise newException(IOError, "fsync failed: " & osErrorMsg(OSErrorCode(-fsyncRes)))
 
-  let closeRes = await uringClose(u, fd.cint)
-  if closeRes < 0:
-    raise newException(IOError, "close failed: " & osErrorMsg(OSErrorCode(-closeRes)))
+    closed = true
+    let closeRes = await uringClose(u, fd.cint)
+    if closeRes < 0:
+      raise newException(IOError, "close failed: " & osErrorMsg(OSErrorCode(-closeRes)))
+  finally:
+    if not closed:
+      discard await uringClose(u, fd.cint)
 
 proc readFileString*(
     u: UringFileIO, path: string, maxSize: int = 1048576

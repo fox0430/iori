@@ -79,25 +79,31 @@ proc drainEventfd(u: UringFileIO) =
     if err != posix.EAGAIN:
       raiseOSError(OSErrorCode(err), "eventfd read failed")
 
-proc startPollLoop(u: UringFileIO) =
+proc startPollLoop(u: UringFileIO) {.raises: [OSError].} =
   u.selfRef = u
-  registerFdReader(
-    u.eventFd,
-    proc() {.gcsafe, raises: [].} =
-      if u.closed:
-        return
-      try:
-        u.drainEventfd()
-      except OSError:
-        discard
-      u.processCqes(),
-  )
+  try:
+    registerFdReader(
+      u.eventFd,
+      proc() {.gcsafe, raises: [].} =
+        if u.closed:
+          return
+        try:
+          u.drainEventfd()
+        except OSError:
+          discard
+        u.processCqes(),
+    )
+  except CatchableError as e:
+    raise (ref OSError)(msg: "eventfd registration failed: " & e.msg)
 
-proc stopPollLoop(u: UringFileIO) =
-  unregisterFdReader(u.eventFd)
+proc stopPollLoop(u: UringFileIO) {.raises: [].} =
+  try:
+    unregisterFdReader(u.eventFd)
+  except CatchableError:
+    discard
   u.selfRef = nil
 
-proc flush*(u: UringFileIO) =
+proc flush*(u: UringFileIO) {.raises: [].} =
   ## Flush all queued SQEs to the kernel in a single io_uring_enter syscall.
   u.flushScheduled = false
   if u.closed or u.unsubmitted.len == 0:
@@ -306,7 +312,7 @@ proc uringRenameat*(
 
 # Lifecycle
 
-proc newUringFileIO*(entries: uint32 = 256): UringFileIO =
+proc newUringFileIO*(entries: uint32 = 256): UringFileIO {.raises: [OSError].} =
   ## Create a new UringFileIO instance. Initializes io_uring and starts poll loop.
   var ring = setupRing(entries)
 
@@ -317,10 +323,10 @@ proc newUringFileIO*(entries: uint32 = 256): UringFileIO =
 
   try:
     registerEventfd(ring, efd)
-  except OSError:
+  except OSError as e:
     discard close(efd)
     closeRing(ring)
-    raise
+    raise e
 
   result = UringFileIO(
     ring: ring,
@@ -329,9 +335,15 @@ proc newUringFileIO*(entries: uint32 = 256): UringFileIO =
     pending: initTable[uint64, Completion](),
     closed: false,
   )
-  startPollLoop(result)
+  try:
+    startPollLoop(result)
+  except OSError as e:
+    unregisterEventfd(ring)
+    discard close(efd)
+    closeRing(ring)
+    raise e
 
-proc close*(u: UringFileIO) =
+proc close*(u: UringFileIO) {.raises: [].} =
   ## Close the UringFileIO instance. Fails all pending futures and releases resources.
   if u.closed:
     return
@@ -348,7 +360,8 @@ proc close*(u: UringFileIO) =
     pending.add(comp)
   u.pending.clear()
   for comp in pending:
-    comp.future.fail(newException(IOError, "UringFileIO closed"))
+    {.cast(raises: []).}:
+      comp.future.fail(newException(IOError, "UringFileIO closed"))
 
   unregisterEventfd(u.ring)
   discard close(u.eventFd)

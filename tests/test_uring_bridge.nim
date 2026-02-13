@@ -273,3 +273,14 @@ suite "uring_bridge":
         doAssert readRes == -9 # -EBADF
 
     waitFor run()
+
+  test "newUringFileIO, flush, and close callable from async":
+    ## Compile-time regression: ensures all public sync functions in
+    ## uring_bridge can be called from async procs without raises errors.
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let io2 = newUringFileIO()
+        io2.flush()
+        io2.close()
+
+    waitFor run()
