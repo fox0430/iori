@@ -213,6 +213,24 @@ suite "uring_file_io":
 
     waitFor run()
 
+  test "full lifecycle inside async proc":
+    ## Regression: newUringFileIO() must be callable from async procs.
+    ## Without proper {.raises.} annotations, Chronos rejects sync calls
+    ## that the compiler treats as raising Exception.
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let io2 = newUringFileIO()
+        let path = getTempDir() / "iori_test_async_lifecycle.txt"
+        defer:
+          removeFile(path)
+
+        await io2.writeFileString(path, "async lifecycle test")
+        let content = await io2.readFileString(path)
+        doAssert content == "async lifecycle test"
+        io2.close()
+
+    waitFor run()
+
   test "close during pending operations does not crash":
     ## Exercises the processCqes closed-safety guard.
     ## Submit multiple operations, then close before completions arrive.

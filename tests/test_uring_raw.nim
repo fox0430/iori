@@ -3,6 +3,7 @@
 import std/[unittest, posix]
 
 import ../iori/uring_raw
+import ../iori/async_backend
 
 proc eventfd(initval: cuint, flags: cint): cint {.importc, header: "<sys/eventfd.h>".}
 
@@ -192,3 +193,34 @@ suite "uring_raw":
     let cqe2 = peekCqe(ring)
     check cqe2 != nil
     advanceCq(ring)
+
+  test "all public sync functions callable from async":
+    ## Compile-time regression: ensures the compiler's raises inference
+    ## allows all uring_raw sync functions to be called from async procs.
+    proc run() {.async.} =
+      # setupRing, closeRing
+      var ring = setupRing(4)
+
+      # registerEventfd, unregisterEventfd
+      let efd = eventfd(0, EFD_NONBLOCK or EFD_CLOEXEC)
+      doAssert efd >= 0
+      registerEventfd(ring, efd)
+      unregisterEventfd(ring)
+      discard close(efd)
+
+      # getSqe, setLastSqeUserData, submit, peekCqe, advanceCq
+      let sqe = getSqe(ring)
+      doAssert sqe != nil
+      sqe.opcode = IORING_OP_NOP
+      setLastSqeUserData(ring, 1)
+      let ret = submit(ring)
+      doAssert ret >= 0
+      discard submit(ring, waitNr = 1)
+      let cqe = peekCqe(ring)
+      doAssert cqe != nil
+      doAssert cqe.res == 0
+      advanceCq(ring)
+
+      closeRing(ring)
+
+    waitFor run()

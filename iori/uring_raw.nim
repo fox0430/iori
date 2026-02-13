@@ -261,7 +261,9 @@ proc atomicStoreRelease(p: ptr uint32, val: uint32) {.inline.} =
 
 # Ring setup / teardown
 
-proc setupRing*(entries: uint32 = 256, flags: uint32 = 0): IoUring =
+proc setupRing*(
+    entries: uint32 = 256, flags: uint32 = 0
+): IoUring {.raises: [OSError].} =
   ## Initialize io_uring: setup ring and mmap 3 regions.
   ## Raises OSError on failure.
   var params: IoUringParams
@@ -452,7 +454,7 @@ proc advanceCq*(ring: var IoUring) =
   let head = ring.cqHead[] + 1
   atomicStoreRelease(ring.cqHead, head)
 
-proc registerEventfd*(ring: var IoUring, efd: cint) =
+proc registerEventfd*(ring: var IoUring, efd: cint) {.raises: [OSError].} =
   ## Register an eventfd with the io_uring ring. Raises OSError on failure.
   var efdVal = cint(efd)
   let res = ioUringRegister(ring.ringFd, IORING_REGISTER_EVENTFD, addr efdVal, 1)

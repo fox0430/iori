@@ -18,13 +18,17 @@ when hasChronos:
     let afd = AsyncFD(fd)
     register2(afd).tryGet()
 
-    addReader2(
-      afd,
-      proc(udata: pointer) {.gcsafe, raises: [].} =
-        cb(),
-      nil,
-    )
-    .tryGet()
+    try:
+      addReader2(
+        afd,
+        proc(udata: pointer) {.gcsafe, raises: [].} =
+          cb(),
+        nil,
+      )
+      .tryGet()
+    except CatchableError as e:
+      discard unregister2(afd)
+      raise e
 
   proc unregisterFdReader*(fd: cint) =
     let afd = AsyncFD(fd)
@@ -45,13 +49,17 @@ elif hasAsyncDispatch:
   proc registerFdReader*(fd: cint, cb: proc() {.gcsafe, raises: [].}) =
     let afd = AsyncFD(fd)
     register(afd)
-    addRead(
-      afd,
-      proc(fd: AsyncFD): bool =
-        cb()
-        return false # keep watching; unregister via unregisterFdReader
-      ,
-    )
+    try:
+      addRead(
+        afd,
+        proc(fd: AsyncFD): bool =
+          cb()
+          return false # keep watching; unregister via unregisterFdReader
+        ,
+      )
+    except CatchableError as e:
+      unregister(afd)
+      raise e
 
   proc unregisterFdReader*(fd: cint) =
     unregister(AsyncFD(fd))
