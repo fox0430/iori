@@ -26,7 +26,7 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFile(path, data)
-        let readResult = await io.readFile(path, 4096)
+        let readResult = await io.readFile(path)
         doAssert readResult == data
 
     waitFor run()
@@ -41,7 +41,7 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFileString(path, content)
-        let readResult = await io.readFileString(path, 4096)
+        let readResult = await io.readFileString(path)
         doAssert readResult == content
 
     waitFor run()
@@ -70,7 +70,7 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFile(path, data)
-        let readResult = await io.readFile(path, 65536)
+        let readResult = await io.readFile(path)
         doAssert readResult.len == data.len
         doAssert readResult == data
 
@@ -84,7 +84,7 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFile(path, @[])
-        let readResult = await io.readFile(path, 4096)
+        let readResult = await io.readFile(path)
         doAssert readResult.len == 0
 
     waitFor run()
@@ -97,55 +97,8 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFileString(path, "")
-        let readResult = await io.readFileString(path, 4096)
+        let readResult = await io.readFileString(path)
         doAssert readResult.len == 0
-
-    waitFor run()
-
-  test "readFile with maxSize=0 on empty file returns empty":
-    let path = getTempDir() / "iori_test_maxsize0_empty.bin"
-    defer:
-      removeFile(path)
-
-    proc run() {.async.} =
-      {.cast(gcsafe).}:
-        await io.writeFile(path, @[])
-        let readBack = await io.readFile(path, maxSize = 0)
-        doAssert readBack.len == 0
-
-    waitFor run()
-
-  test "readFile raises IOError when file exceeds maxSize":
-    let path = getTempDir() / "iori_test_exceeds_maxsize.bin"
-    defer:
-      removeFile(path)
-
-    proc run() {.async.} =
-      {.cast(gcsafe).}:
-        await io.writeFile(path, @[byte 1, 2, 3])
-        var raised = false
-        try:
-          discard await io.readFile(path, maxSize = 2)
-        except IOError:
-          raised = true
-        doAssert raised
-
-    waitFor run()
-
-  test "readFile with maxSize=0 on non-empty file raises IOError":
-    let path = getTempDir() / "iori_test_maxsize0_nonempty.bin"
-    defer:
-      removeFile(path)
-
-    proc run() {.async.} =
-      {.cast(gcsafe).}:
-        await io.writeFile(path, @[byte 1, 2, 3])
-        var raised = false
-        try:
-          discard await io.readFile(path, maxSize = 0)
-        except IOError:
-          raised = true
-        doAssert raised
 
     waitFor run()
 
@@ -158,7 +111,7 @@ suite "uring_file_io":
       {.cast(gcsafe).}:
         await io.writeFile(path, @[byte 1, 2, 3, 4, 5])
         await io.writeFile(path, @[byte 10, 20])
-        let readBack = await io.readFile(path, 4096)
+        let readBack = await io.readFile(path)
         doAssert readBack == @[byte 10, 20]
 
     waitFor run()
@@ -182,8 +135,8 @@ suite "uring_file_io":
         await futB
 
         # Read both files concurrently
-        let futReadA = io.readFile(pathA, 4096)
-        let futReadB = io.readFile(pathB, 4096)
+        let futReadA = io.readFile(pathA)
+        let futReadB = io.readFile(pathB)
         let resultA = await futReadA
         let resultB = await futReadB
 
@@ -214,7 +167,7 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFile(path, data, fsync = false)
-        let readResult = await io.readFile(path, 4096)
+        let readResult = await io.readFile(path)
         doAssert readResult == data
 
     waitFor run()
@@ -227,20 +180,8 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFileString(path, "no fsync test", fsync = false)
-        let readResult = await io.readFileString(path, 4096)
+        let readResult = await io.readFileString(path)
         doAssert readResult == "no fsync test"
-
-    waitFor run()
-
-  test "readFile with maxSize > uint32 max raises IOError":
-    proc run() {.async.} =
-      {.cast(gcsafe).}:
-        var raised = false
-        try:
-          discard await io.readFile("/dev/null", maxSize = int(high(uint32)) + 1)
-        except IOError:
-          raised = true
-        doAssert raised
 
     waitFor run()
 
@@ -278,7 +219,7 @@ suite "uring_file_io":
         # Start multiple reads concurrently
         var futs: seq[Future[seq[byte]]]
         for i in 0 ..< 4:
-          futs.add(io2.readFile(path, 4096))
+          futs.add(io2.readFile(path))
 
         # Close while operations are in flight
         io2.close()
@@ -356,7 +297,7 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFile(path, data)
-        let r = await io.readFile(path, 4096, timeoutMs = 5000)
+        let r = await io.readFile(path, timeoutMs = 5000)
         doAssert r == data
 
     waitFor run()
@@ -371,7 +312,7 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFile(path, data, timeoutMs = 5000)
-        let r = await io.readFile(path, 4096)
+        let r = await io.readFile(path)
         doAssert r == data
 
     waitFor run()
@@ -384,7 +325,7 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFileString(path, "timeout test")
-        let r = await io.readFileString(path, 4096, timeoutMs = 5000)
+        let r = await io.readFileString(path, timeoutMs = 5000)
         doAssert r == "timeout test"
 
     waitFor run()
@@ -397,7 +338,7 @@ suite "uring_file_io":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         await io.writeFileString(path, "timeout test", timeoutMs = 5000)
-        let r = await io.readFileString(path, 4096)
+        let r = await io.readFileString(path)
         doAssert r == "timeout test"
 
     waitFor run()
