@@ -1,1 +1,1 @@
-import test_uring_bridge, test_uring_file_io, test_uring_raw
+import test_uring_bridge, test_uring_file_io, test_uring_raw, test_multithread
