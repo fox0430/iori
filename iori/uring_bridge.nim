@@ -1,7 +1,7 @@
 ## eventfd bridge + Low-level API for io_uring.
 ##
 ## Integrates io_uring with async event loop via eventfd.
-## Provides low-level API returning Future[int32] for each io_uring operation.
+## Provides low-level API returning `Future[int32]` for each io_uring operation.
 
 when not defined(linux):
   {.fatal: "uring_bridge requires Linux".}
@@ -39,6 +39,8 @@ type
     statxRef: ref Statx # GC root for statx output buffer
 
   UringFileIO* = ref object
+    ## Handle for async file I/O via io_uring.
+    ## Create with `newUringFileIO`, release with `close`.
     ring*: IoUring
     eventFd: cint
     nextId: uint64
