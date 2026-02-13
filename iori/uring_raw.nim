@@ -107,8 +107,7 @@ const
 # Kernel ABI structures
 
 type
-  IoSqRingOffsets* = object
-    ## Kernel-provided offsets for SQ ring mmap region.
+  IoSqRingOffsets* = object ## Kernel-provided offsets for SQ ring mmap region.
     head*: uint32
     tail*: uint32
     ringMask*: uint32
@@ -119,8 +118,7 @@ type
     resv1*: uint32
     userAddr*: uint64
 
-  IoCqRingOffsets* = object
-    ## Kernel-provided offsets for CQ ring mmap region.
+  IoCqRingOffsets* = object ## Kernel-provided offsets for CQ ring mmap region.
     head*: uint32
     tail*: uint32
     ringMask*: uint32
