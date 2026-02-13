@@ -38,7 +38,7 @@ when hasChronos:
     try:
       addReader2(
         afd,
-        proc(udata: pointer) {.gcsafe, raises: [].} =
+        proc(udata: pointer) {.raises: [].} =
           cb(),
         nil,
       )
@@ -56,7 +56,7 @@ when hasChronos:
   proc scheduleSoon*(cb: proc() {.gcsafe, raises: [].}) =
     ## Schedule `cb` to run on the next event loop tick.
     callSoon(
-      proc(udata: pointer) {.gcsafe, raises: [].} =
+      proc(udata: pointer) {.raises: [].} =
         cb(),
       nil,
     )
@@ -100,7 +100,7 @@ elif hasAsyncDispatch:
   proc scheduleSoon*(cb: proc() {.gcsafe, raises: [].}) =
     ## Schedule `cb` to run on the next event loop tick.
     callSoon(
-      proc() {.gcsafe.} =
+      proc() =
         cb()
     )
 
