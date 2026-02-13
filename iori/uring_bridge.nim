@@ -377,6 +377,42 @@ proc uringStatx*(
   var comp = Completion(future: fut, kind: ckStatx, strRef: pathRef, statxRef: statxBuf)
   return queueSqe(u, comp)
 
+proc uringStatxFd*(
+    u: UringFileIO, fd: cint, mask: uint32, statxBuf: ref Statx
+): Future[int32] =
+  ## Submit STATX on an open fd (AT_EMPTY_PATH). Returns Future with 0 on success
+  ## or negative errno. Results are written to statxBuf.
+  let fut = newFuture[int32]("uringStatxFd")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
+  let sqe = getSqe(u.ring)
+  if sqe == nil:
+    fut.fail(newException(IOError, "io_uring SQ full"))
+    return fut
+
+  # AT_EMPTY_PATH with empty path string performs statx on the fd itself.
+  var pathRef: ref string
+  new(pathRef)
+  pathRef[] = ""
+
+  sqe.opcode = IORING_OP_STATX
+  sqe.fd = fd
+  sqe.`addr` = cast[uint64](pathRef[].cstring)
+  sqe.len = mask
+  sqe.off = cast[uint64](addr statxBuf[])
+  sqe.opFlags = cast[uint32](AT_EMPTY_PATH)
+
+  var comp = Completion(future: fut, kind: ckStatx, strRef: pathRef, statxRef: statxBuf)
+  return queueSqe(u, comp)
+
 proc uringRenameat*(
     u: UringFileIO, oldPath: string, newPath: string, flags: uint32 = 0
 ): Future[int32] =

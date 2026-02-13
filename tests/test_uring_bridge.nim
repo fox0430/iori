@@ -466,6 +466,70 @@ suite "uring_bridge":
 
     waitFor run()
 
+  test "uringStatxFd returns correct size for open fd":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_statxfd.txt"
+        defer:
+          removeFile(path)
+
+        let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fd >= 0
+        let data = "hello"
+        doAssert posix.write(fd, data.cstring, data.len) == data.len
+        discard posix.close(fd)
+
+        let fdRes = await io.uringOpen(path, O_RDONLY, 0)
+        doAssert fdRes >= 0
+
+        var stx = new(Statx)
+        let res = await io.uringStatxFd(fdRes.cint, STATX_BASIC_STATS, stx)
+        doAssert res == 0
+        doAssert stx.stxSize == 5
+        doAssert (stx.stxMode and 0o170000'u16) == 0o100000'u16 # S_IFREG
+
+        discard await io.uringClose(fdRes.cint)
+
+    waitFor run()
+
+  test "uringStatxFd reflects fd not path after file replacement":
+    ## TOCTOU proof: after opening a file, replacing the file at the same path
+    ## must not affect statx on the original fd.
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_statxfd_toctou.txt"
+        defer:
+          removeFile(path)
+
+        # Create original file (5 bytes)
+        let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fd >= 0
+        let data = "hello"
+        doAssert posix.write(fd, data.cstring, data.len) == data.len
+        discard posix.close(fd)
+
+        # Open via io_uring (holds reference to original inode)
+        let fdRes = await io.uringOpen(path, O_RDONLY, 0)
+        doAssert fdRes >= 0
+
+        # Replace file at same path: unlink + create new inode with larger content
+        removeFile(path)
+        let fd2 = posix.open(path.cstring, O_WRONLY or O_CREAT, 0o644)
+        doAssert fd2 >= 0
+        let data2 = "hello world!!"
+        doAssert posix.write(fd2, data2.cstring, data2.len) == data2.len
+        discard posix.close(fd2)
+
+        # statxFd on the original fd must return 5, not 13
+        var stx = new(Statx)
+        let res = await io.uringStatxFd(fdRes.cint, STATX_SIZE, stx)
+        doAssert res == 0
+        doAssert stx.stxSize == 5, "expected 5 but got " & $stx.stxSize
+
+        discard await io.uringClose(fdRes.cint)
+
+    waitFor run()
+
   test "newUringFileIO, flush, and close callable from async":
     ## Compile-time regression: ensures all public sync functions in
     ## uring_bridge can be called from async procs without raises errors.

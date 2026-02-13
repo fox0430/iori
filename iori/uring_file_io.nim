@@ -96,21 +96,7 @@ proc readFile*(
     else:
       default(MonoTime)
 
-  # statx to get file size
-  var stx = new(Statx)
-  let statxRes = awaitMaybeTimeout(
-    u, uringStatx(u, path, 0.cint, STATX_SIZE, stx), deadline, Operation.statx
-  )
-  raiseOnError(statxRes, Operation.statx)
-  let fileSize = int(stx.stxSize)
-
-  if fileSize > maxSize:
-    raise
-      newException(IOError, "file size " & $fileSize & " exceeds maxSize " & $maxSize)
-
-  if fileSize <= 0:
-    return @[]
-
+  # Open first, then statx on fd to avoid TOCTOU between statx(path) and open(path).
   let fdRes =
     awaitMaybeTimeout(u, uringOpen(u, path, O_RDONLY, 0), deadline, Operation.open)
   raiseOnError(fdRes, Operation.open)
@@ -118,6 +104,24 @@ proc readFile*(
 
   var closed = false
   try:
+    # statx on the open fd to get file size
+    var stx = new(Statx)
+    let statxRes = awaitMaybeTimeout(
+      u, uringStatxFd(u, fd.cint, STATX_SIZE, stx), deadline, Operation.statx
+    )
+    raiseOnError(statxRes, Operation.statx)
+    let fileSize = int(stx.stxSize)
+
+    if fileSize > maxSize:
+      raise
+        newException(IOError, "file size " & $fileSize & " exceeds maxSize " & $maxSize)
+
+    if fileSize <= 0:
+      closed = true
+      let closeRes = await uringClose(u, fd.cint)
+      raiseOnError(closeRes, Operation.close)
+      return @[]
+
     var buf = newSeq[byte](fileSize)
     var totalRead = 0
     while totalRead < fileSize:
