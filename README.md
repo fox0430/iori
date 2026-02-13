@@ -19,7 +19,7 @@ nimble install iori
 ## Usage
 
 ```nim
-# example.nim
+# examples/simple.nim
 
 import pkg/iori
 
@@ -42,11 +42,11 @@ Compile with an async backend:
 
 ```bash
 # Use std/asyncdispatch
-nim c -d:asyncBackend=asyncdispatch -r example.nim
+nim c -d:asyncBackend=asyncdispatch -r examples/simple.nim
 
 # Use Chronos
 nimble install chronos
-nim c -d:asyncBackend=chronos -r example.nim
+nim c -d:asyncBackend=chronos -r examples/simple.nim
 ```
 
 ## TODO

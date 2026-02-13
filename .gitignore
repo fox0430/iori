@@ -8,4 +8,7 @@ tests/*
 iori/*
 !iori/*.*
 
+examples/*
+!examples/*.*
+
 iori.out
