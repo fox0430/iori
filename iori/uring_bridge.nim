@@ -42,7 +42,7 @@ type
   UringFileIO* = ref object
     ## Handle for async file I/O via io_uring.
     ## Create with `newUringFileIO`, release with `close`.
-    ring*: IoUring
+    ring: IoUring
     eventFd: cint
     nextId: uint64
     pending: Table[uint64, Completion]
