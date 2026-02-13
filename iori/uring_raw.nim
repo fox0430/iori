@@ -107,6 +107,7 @@ const
 
 type
   IoSqRingOffsets* {.packed.} = object
+    ## Kernel-provided offsets for SQ ring mmap region.
     head*: uint32
     tail*: uint32
     ringMask*: uint32
@@ -118,6 +119,7 @@ type
     userAddr*: uint64
 
   IoCqRingOffsets* {.packed.} = object
+    ## Kernel-provided offsets for CQ ring mmap region.
     head*: uint32
     tail*: uint32
     ringMask*: uint32
@@ -129,6 +131,7 @@ type
     userAddr*: uint64
 
   IoUringParams* {.packed.} = object
+    ## Parameters for io_uring_setup syscall. Passed to kernel and filled on return.
     sqEntries*: uint32
     cqEntries*: uint32
     flags*: uint32
@@ -141,6 +144,7 @@ type
     cqOff*: IoCqRingOffsets
 
   IoUringSqe* {.packed.} = object
+    ## Submission Queue Entry. Describes a single I/O operation to submit to the kernel.
     opcode*: uint8
     flags*: uint8
     ioprio*: uint16
@@ -157,16 +161,17 @@ type
     pad2*: array[1, uint64]
 
   IoUringCqe* {.packed.} = object
+    ## Completion Queue Entry. Contains the result of a completed I/O operation.
     userData*: uint64
     res*: int32
     flags*: uint32
 
-  StatxTs* = object
+  StatxTs* = object ## Timestamp component of the `Statx` structure.
     tvSec*: int64
     tvNsec*: uint32
     reserved: int32
 
-  Statx* = object
+  Statx* = object ## File metadata returned by the statx syscall.
     stxMask*: uint32
     stxBlksize*: uint32
     stxAttributes*: uint64
@@ -200,7 +205,7 @@ static:
 
 # IoUring ring object
 
-type IoUring* = object
+type IoUring* = object ## io_uring instance managing SQ/CQ rings and SQE array via mmap.
   ringFd*: cint
 
   # SQ ring
@@ -366,7 +371,8 @@ proc setupRing*(
   result.sqLocalTail = atomicLoadAcquire(result.sqTail)
 
 proc closeRing*(ring: var IoUring) =
-  ## Clean up all ring resources.
+  ## Clean up all ring resources (munmap regions and close fd).
+  ## Safe to call on an already-closed ring (no-op).
   if ring.ringFd < 0:
     return
 

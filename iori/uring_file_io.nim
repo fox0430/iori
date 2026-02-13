@@ -1,7 +1,7 @@
 ## High-level file I/O API built on uring_bridge.
 ##
 ## Provides readFile/writeFile convenience procs that handle
-## open, read/write, fsync, and close automatically.
+## the file descriptor lifecycle (open, read/write, fsync, close) automatically.
 
 import std/[posix, oserrors]
 
