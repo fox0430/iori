@@ -28,6 +28,7 @@ type
     ckClose
     ckStatx
     ckRename
+    ckCancel
 
   Completion = object
     future: Future[int32]
@@ -45,6 +46,7 @@ type
     eventFd: cint
     nextId: uint64
     pending: Table[uint64, Completion]
+    futureToId: Table[pointer, uint64]
     closed: bool
     error: ref CatchableError # Propagated to pending futures
     selfRef: UringFileIO # GC root: prevents collection while poll loop holds raw pointer
@@ -76,6 +78,7 @@ proc processCqes(u: UringFileIO) {.raises: [].} =
 
     var comp: Completion
     if u.pending.pop(id, comp):
+      u.futureToId.del(cast[pointer](comp.future))
       # Each ID is unique and popped from pending, so double-completion is impossible.
       # cast(raises) suppresses the theoretical ValueError from Future.complete.
       {.cast(raises: []).}:
@@ -104,6 +107,7 @@ proc close*(u: UringFileIO) {.raises: [].} =
   for id, comp in u.pending:
     pending.add(comp)
   u.pending.clear()
+  u.futureToId.clear()
   for comp in pending:
     {.cast(raises: []).}:
       comp.future.fail(err)
@@ -153,6 +157,7 @@ proc flush*(u: UringFileIO) {.raises: [].} =
     for id in u.unsubmitted:
       var comp: Completion
       if u.pending.pop(id, comp):
+        u.futureToId.del(cast[pointer](comp.future))
         {.cast(raises: []).}:
           comp.future.fail(
             newException(
@@ -172,6 +177,7 @@ proc queueSqe(u: UringFileIO, comp: Completion): Future[int32] =
   setLastSqeUserData(u.ring, id)
 
   u.pending[id] = comp
+  u.futureToId[cast[pointer](fut)] = id
   u.unsubmitted.add(id)
 
   if not u.flushScheduled:
@@ -407,6 +413,56 @@ proc uringRenameat*(
 
   var comp =
     Completion(future: fut, kind: ckRename, strRef: oldPathRef, strRef2: newPathRef)
+  return queueSqe(u, comp)
+
+proc uringCancel*(u: UringFileIO, target: Future[int32]): Future[int32] =
+  ## Submit ASYNC_CANCEL for a pending operation. Returns Future with 0 on success
+  ## or negative errno. The cancelled target Future will complete with -ECANCELED (-125).
+  let fut = newFuture[int32]("uringCancel")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
+  let targetPtr = cast[pointer](target)
+  if targetPtr notin u.futureToId:
+    fut.fail(newException(IOError, "target operation not found"))
+    return fut
+
+  let targetId = u.futureToId[targetPtr]
+
+  # Check if target is still unsubmitted — cancel locally without kernel roundtrip
+  var unsubIdx = -1
+  for i, id in u.unsubmitted:
+    if id == targetId:
+      unsubIdx = i
+      break
+
+  if unsubIdx >= 0:
+    u.unsubmitted.delete(unsubIdx)
+    var comp: Completion
+    if u.pending.pop(targetId, comp):
+      u.futureToId.del(cast[pointer](comp.future))
+      {.cast(raises: []).}:
+        comp.future.complete(-125'i32)
+    fut.complete(0'i32)
+    return fut
+
+  # Target is already submitted — ask the kernel to cancel it
+  let sqe = getSqe(u.ring)
+  if sqe == nil:
+    fut.fail(newException(IOError, "io_uring SQ full"))
+    return fut
+
+  sqe.opcode = IORING_OP_ASYNC_CANCEL
+  sqe.`addr` = targetId
+
+  var comp = Completion(future: fut, kind: ckCancel)
   return queueSqe(u, comp)
 
 proc newUringFileIO*(entries: uint32 = 256): UringFileIO {.raises: [OSError].} =

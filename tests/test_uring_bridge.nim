@@ -347,6 +347,125 @@ suite "uring_bridge":
 
     waitFor run()
 
+  test "uringCancel cancels kernel-blocked read":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # Create a pipe — reading from read-end blocks until data arrives
+        var fds: array[2, cint]
+        doAssert pipe(fds) == 0
+        let readFd = fds[0]
+        let writeFd = fds[1]
+        defer:
+          discard posix.close(readFd)
+          discard posix.close(writeFd)
+
+        var buf = newSeq[byte](64)
+        let readFut = io.uringRead(readFd, addr buf[0], 64, 0'u64, buf)
+        io.flush()
+
+        # Cancel the blocked read
+        let cancelRes = await io.uringCancel(readFut)
+        doAssert cancelRes == 0, "cancel should succeed: " & $cancelRes
+
+        let readRes = await readFut
+        doAssert readRes == -125, "read should be -ECANCELED: " & $readRes
+
+    waitFor run()
+
+  test "uringCancel cancels unsubmitted operation":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # Queue a read without flushing — it stays in unsubmitted
+        let fd = cint(posix.open("/dev/zero", O_RDONLY))
+        doAssert fd >= 0
+        defer:
+          discard posix.close(fd)
+
+        var buf = newSeq[byte](64)
+        let readFut = io.uringRead(fd, addr buf[0], 64, 0'u64, buf)
+
+        # Cancel before flush — should be a local cancel
+        let cancelRes = await io.uringCancel(readFut)
+        doAssert cancelRes == 0
+
+        let readRes = await readFut
+        doAssert readRes == -125, "read should be -ECANCELED: " & $readRes
+
+    waitFor run()
+
+  test "uringCancel on closed instance fails with IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let dummyFut = newFuture[int32]("dummy")
+        var raised = false
+        try:
+          discard await io2.uringCancel(dummyFut)
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "futureToId cleaned on flush submit failure":
+    var io2 = newUringFileIO(32)
+    defer:
+      io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # Queue an operation (stays unsubmitted)
+        let fut = io2.uringOpen("/dev/null", O_RDONLY, 0)
+
+        # Sabotage ring fd to force submit failure
+        let savedFd = io2.ring.ringFd
+        io2.ring.ringFd = -1
+        io2.flush()
+        io2.ring.ringFd = savedFd
+
+        # fut should have been failed by flush
+        var raised = false
+        try:
+          discard await fut
+        except IOError:
+          raised = true
+        doAssert raised
+
+        # futureToId must be clean — cancel should get "not found"
+        raised = false
+        try:
+          discard await io2.uringCancel(fut)
+        except IOError as e:
+          doAssert "target operation not found" in e.msg
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "uringCancel on completed operation fails with 'not found'":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let fdRes = await io.uringOpen("/dev/null", O_RDONLY, 0)
+        doAssert fdRes >= 0
+
+        let closeFut = io.uringClose(fdRes)
+        let closeRes = await closeFut
+
+        doAssert closeRes == 0
+
+        # closeFut is already completed — futureToId entry removed
+        var raised = false
+        try:
+          discard await io.uringCancel(closeFut)
+        except IOError as e:
+          doAssert "target operation not found" in e.msg
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
   test "newUringFileIO, flush, and close callable from async":
     ## Compile-time regression: ensures all public sync functions in
     ## uring_bridge can be called from async procs without raises errors.
