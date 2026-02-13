@@ -64,3 +64,10 @@ jobs:
 
       - name: Run tests
         run: nimble test -y
+
+      - name: Build examples
+        run: |
+          nimble install
+
+          for f in examples/*.nim; do nim c -d:asyncBackend=asyncdispatch "$f"; done
+          for f in examples/*.nim; do nim c -d:asyncBackend=chronos "$f"; done
