@@ -107,7 +107,7 @@ const
 # Kernel ABI structures
 
 type
-  IoSqRingOffsets* {.packed.} = object
+  IoSqRingOffsets* = object
     ## Kernel-provided offsets for SQ ring mmap region.
     head*: uint32
     tail*: uint32
@@ -119,7 +119,7 @@ type
     resv1*: uint32
     userAddr*: uint64
 
-  IoCqRingOffsets* {.packed.} = object
+  IoCqRingOffsets* = object
     ## Kernel-provided offsets for CQ ring mmap region.
     head*: uint32
     tail*: uint32
@@ -131,7 +131,7 @@ type
     resv1*: uint32
     userAddr*: uint64
 
-  IoUringParams* {.packed.} = object
+  IoUringParams* = object
     ## Parameters for io_uring_setup syscall. Passed to kernel and filled on return.
     sqEntries*: uint32
     cqEntries*: uint32
@@ -144,7 +144,7 @@ type
     sqOff*: IoSqRingOffsets
     cqOff*: IoCqRingOffsets
 
-  IoUringSqe* {.packed.} = object
+  IoUringSqe* = object
     ## Submission Queue Entry. Describes a single I/O operation to submit to the kernel.
     opcode*: uint8
     flags*: uint8
@@ -161,7 +161,7 @@ type
     addr3*: uint64
     pad2*: array[1, uint64]
 
-  IoUringCqe* {.packed.} = object
+  IoUringCqe* = object
     ## Completion Queue Entry. Contains the result of a completed I/O operation.
     userData*: uint64
     res*: int32
