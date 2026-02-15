@@ -612,6 +612,183 @@ suite "uring_bridge":
 
     waitFor run()
 
+  test "chain: write + fsync succeeds":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_chain_write_fsync.bin"
+        defer:
+          removeFile(path)
+
+        let fdRes = await io.uringOpen(path, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fdRes >= 0
+
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 1, 2, 3, 4, 5]
+
+        io.beginChain()
+        let writeFut = io.uringWrite(fdRes.cint, addr bufRef[][0], 5, 0'u64, bufRef)
+        let fsyncFut = io.uringFsync(fdRes.cint)
+        let futs = io.endChain()
+
+        doAssert futs.len == 2
+        doAssert futs[0] == writeFut
+        doAssert futs[1] == fsyncFut
+
+        let writeRes = await writeFut
+        let fsyncRes = await fsyncFut
+
+        doAssert writeRes == 5, "write failed: " & $writeRes
+        doAssert fsyncRes == 0, "fsync failed: " & $fsyncRes
+
+        discard await io.uringClose(fdRes.cint)
+
+    waitFor run()
+
+  test "chain: failure propagation (bad fd)":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # Use an invalid fd to trigger write failure; fsync should get -ECANCELED
+        let badFd = 9999.cint
+
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 1, 2, 3]
+
+        io.beginChain()
+        let writeFut = io.uringWrite(badFd, addr bufRef[][0], 3, 0'u64, bufRef)
+        let fsyncFut = io.uringFsync(badFd)
+        discard io.endChain()
+
+        let writeRes = await writeFut
+        let fsyncRes = await fsyncFut
+
+        doAssert writeRes < 0, "write should fail: " & $writeRes
+        doAssert fsyncRes == -125, "fsync should be -ECANCELED: " & $fsyncRes
+
+    waitFor run()
+
+  test "chain: SQ-full rolls back entire chain":
+    var io2 = newUringFileIO(4)
+    defer:
+      io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # Fill SQ slots leaving room for only 1 more
+        var filled = 0
+        while true:
+          let sqe = getSqe(io2.ring)
+          if sqe == nil:
+            break
+          inc filled
+
+        # Roll back the dummy SQEs we just allocated, but keep only 1 slot
+        rollbackSqes(io2.ring, uint32(filled))
+        # Now fill all but 1
+        for i in 0 ..< filled - 1:
+          let sqe = getSqe(io2.ring)
+          doAssert sqe != nil
+
+        # Start chain needing 2 slots but only 1 is available
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 1, 2, 3]
+
+        io2.beginChain()
+        let writeFut = io2.uringWrite(1.cint, addr bufRef[][0], 3, 0'u64, bufRef)
+        let fsyncFut = io2.uringFsync(1.cint)
+        let futs = io2.endChain()
+
+        doAssert futs.len == 2
+
+        # Both futures should fail
+        var writeRaised = false
+        try:
+          discard await writeFut
+        except IOError:
+          writeRaised = true
+        doAssert writeRaised
+
+        var fsyncRaised = false
+        try:
+          discard await fsyncFut
+        except IOError:
+          fsyncRaised = true
+        doAssert fsyncRaised
+
+        # Ring should still be usable after rollback —
+        # roll back the dummy fills first
+        rollbackSqes(io2.ring, uint32(filled - 1))
+        let fd = await io2.uringOpen("/dev/null", O_RDONLY, 0)
+        doAssert fd >= 0
+        discard await io2.uringClose(fd.cint)
+
+    waitFor run()
+
+  test "chain: single element (no IOSQE_IO_LINK)":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_chain_single.bin"
+        defer:
+          removeFile(path)
+
+        let fdRes = await io.uringOpen(path, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fdRes >= 0
+
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 42]
+
+        io.beginChain()
+        let writeFut = io.uringWrite(fdRes.cint, addr bufRef[][0], 1, 0'u64, bufRef)
+        let futs = io.endChain()
+
+        doAssert futs.len == 1
+        doAssert futs[0] == writeFut
+
+        let writeRes = await writeFut
+        doAssert writeRes == 1
+
+        discard await io.uringClose(fdRes.cint)
+
+    waitFor run()
+
+  test "chain: empty chain returns empty seq":
+    io.beginChain()
+    let futs = io.endChain()
+    doAssert futs.len == 0
+
+  test "chain: cancel preserves link flag (NOP keeps IOSQE_IO_LINK)":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_chain_cancel.bin"
+        defer:
+          removeFile(path)
+
+        let fdRes = await io.uringOpen(path, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fdRes >= 0
+
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 10, 20, 30]
+
+        io.beginChain()
+        let writeFut = io.uringWrite(fdRes.cint, addr bufRef[][0], 3, 0'u64, bufRef)
+        let fsyncFut = io.uringFsync(fdRes.cint)
+        discard io.endChain()
+
+        # Cancel the first operation (write) — NOP should keep IOSQE_IO_LINK
+        let cancelRes = await io.uringCancel(writeFut)
+        doAssert cancelRes == 0
+
+        let writeRes = await writeFut
+        doAssert writeRes == -125, "write should be -ECANCELED: " & $writeRes
+
+        # The fsync should still execute since NOP with IOSQE_IO_LINK succeeds
+        # and the link continues
+        let fsyncRes = await fsyncFut
+        doAssert fsyncRes == 0, "fsync should succeed: " & $fsyncRes
+
+        discard await io.uringClose(fdRes.cint)
+
+    waitFor run()
+
   test "local cancel prevents stale SQE submission":
     ## After local cancel of an unsubmitted operation, the SQE must not be
     ## submitted to the kernel on the next flush. Uses a pipe to detect

@@ -421,6 +421,20 @@ proc setLastSqeUserData*(ring: var IoUring, userData: uint64) =
   let idx = (ring.sqLocalTail - 1) and ring.sqMask[]
   ring.sqes[idx].userData = userData
 
+proc setLastSqeFlags*(ring: var IoUring, flags: uint8) =
+  ## Add flags to the most recently obtained SQE (via getSqe).
+  let idx = (ring.sqLocalTail - 1) and ring.sqMask[]
+  ring.sqes[idx].flags = ring.sqes[idx].flags or flags
+
+proc clearLastSqeFlags*(ring: var IoUring, flags: uint8) =
+  ## Clear flags from the most recently obtained SQE (via getSqe).
+  let idx = (ring.sqLocalTail - 1) and ring.sqMask[]
+  ring.sqes[idx].flags = ring.sqes[idx].flags and not flags
+
+proc rollbackSqes*(ring: var IoUring, count: uint32) =
+  ## Roll back the last `count` getSqe allocations (safe only before submit).
+  ring.sqLocalTail -= count
+
 proc submit*(ring: var IoUring, waitNr: uint32 = 0): cint =
   ## Submit pending SQEs to the kernel.
   ## Returns number of SQEs submitted, or negative errno.
@@ -475,9 +489,11 @@ proc nopifySqe*(ring: var IoUring, userData: uint64) =
   while idx != ring.sqLocalTail:
     let sqeIdx = idx and mask
     if ring.sqes[sqeIdx].userData == userData:
+      let savedFlags = ring.sqes[sqeIdx].flags
       zeroMem(addr ring.sqes[sqeIdx], sizeof(IoUringSqe))
       ring.sqes[sqeIdx].opcode = IORING_OP_NOP
       ring.sqes[sqeIdx].userData = userData
+      ring.sqes[sqeIdx].flags = savedFlags
       return
     idx += 1
 
