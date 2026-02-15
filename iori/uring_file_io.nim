@@ -116,37 +116,57 @@ proc readFile*(
 
     var bufRef = new(seq[byte])
     bufRef[] = newSeq[byte](fileSize)
-    var totalRead = 0
-    while totalRead < fileSize:
-      let remaining = min(fileSize - totalRead, int(high(uint32)))
-      let readRes = awaitMaybeTimeout(
-        u,
-        uringRead(
+
+    if fileSize <= int(high(uint32)):
+      # Single read: chain read → close
+      u.beginChain()
+      let readFut =
+        uringRead(u, fd.cint, addr bufRef[][0], uint32(fileSize), 0'u64, bufRef)
+      let closeFut = uringClose(u, fd.cint)
+      discard u.endChain()
+
+      let readRes = awaitMaybeTimeout(u, readFut, deadline, Operation.read)
+      raiseOnError(readRes, Operation.read)
+      let totalRead = readRes.int
+      bufRef[].setLen(totalRead)
+
+      closed = true
+      let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+      raiseOnError(closeRes, Operation.close)
+      return bufRef[]
+    else:
+      # Multi-read loop
+      var totalRead = 0
+      while totalRead < fileSize:
+        let remaining = min(fileSize - totalRead, int(high(uint32)))
+        let readRes = awaitMaybeTimeout(
           u,
-          fd.cint,
-          addr bufRef[][totalRead],
-          uint32(remaining),
-          uint64(totalRead),
-          bufRef,
-        ),
-        deadline,
-        Operation.read,
-      )
-      if readRes <= 0:
-        closed = true
-        let closeRes = await uringClose(u, fd.cint)
-        raiseOnError(readRes, Operation.read)
-        raiseOnError(closeRes, Operation.close)
-        bufRef[].setLen(totalRead)
-        return bufRef[]
-      totalRead += readRes.int
+          uringRead(
+            u,
+            fd.cint,
+            addr bufRef[][totalRead],
+            uint32(remaining),
+            uint64(totalRead),
+            bufRef,
+          ),
+          deadline,
+          Operation.read,
+        )
+        if readRes <= 0:
+          closed = true
+          let closeRes = await uringClose(u, fd.cint)
+          raiseOnError(readRes, Operation.read)
+          raiseOnError(closeRes, Operation.close)
+          bufRef[].setLen(totalRead)
+          return bufRef[]
+        totalRead += readRes.int
 
-    closed = true
-    let closeRes = await uringClose(u, fd.cint)
-    raiseOnError(closeRes, Operation.close)
+      closed = true
+      let closeRes = await uringClose(u, fd.cint)
+      raiseOnError(closeRes, Operation.close)
 
-    bufRef[].setLen(totalRead)
-    return bufRef[]
+      bufRef[].setLen(totalRead)
+      return bufRef[]
   finally:
     if not closed:
       discard await uringClose(u, fd.cint)
@@ -176,7 +196,35 @@ proc writeFile*(
 
   var closed = false
   try:
-    if data.len > 0:
+    if data.len > 0 and data.len <= int(high(uint32)):
+      # Single write: chain write → (fsync →) close
+      var dataRef = new(seq[byte])
+      dataRef[] = data
+      var fsyncFut: Future[int32]
+
+      u.beginChain()
+      let writeFut =
+        uringWrite(u, fd.cint, addr dataRef[][0], uint32(data.len), 0'u64, dataRef)
+      if fsync:
+        fsyncFut = uringFsync(u, fd.cint)
+      let closeFut = uringClose(u, fd.cint)
+      discard u.endChain()
+
+      let writeRes = awaitMaybeTimeout(u, writeFut, deadline, Operation.write)
+      raiseOnError(writeRes, Operation.write)
+      if writeRes <= 0:
+        closed = true
+        raise newException(IOError, "write stalled: 0 bytes written")
+
+      if fsync:
+        let fsyncRes = awaitMaybeTimeout(u, fsyncFut, deadline, Operation.fsync)
+        raiseOnError(fsyncRes, Operation.fsync)
+
+      closed = true
+      let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+      raiseOnError(closeRes, Operation.close)
+    elif data.len > 0:
+      # Multi-write loop
       var dataRef = new(seq[byte])
       dataRef[] = data
       var written = 0
@@ -202,17 +250,41 @@ proc writeFile*(
           raise newException(IOError, "write stalled: 0 bytes written")
         written += writeRes.int
 
-    if fsync:
-      let fsyncRes =
-        awaitMaybeTimeout(u, uringFsync(u, fd.cint), deadline, Operation.fsync)
-      if fsyncRes < 0:
-        closed = true
-        discard await uringClose(u, fd.cint)
-        raiseOnError(fsyncRes, Operation.fsync)
+      # Chain fsync → close or just close
+      if fsync:
+        u.beginChain()
+        let fsyncFut = uringFsync(u, fd.cint)
+        let closeFut = uringClose(u, fd.cint)
+        discard u.endChain()
 
-    closed = true
-    let closeRes = await uringClose(u, fd.cint)
-    raiseOnError(closeRes, Operation.close)
+        let fsyncRes = awaitMaybeTimeout(u, fsyncFut, deadline, Operation.fsync)
+        raiseOnError(fsyncRes, Operation.fsync)
+        closed = true
+        let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+        raiseOnError(closeRes, Operation.close)
+      else:
+        closed = true
+        let closeRes =
+          awaitMaybeTimeout(u, uringClose(u, fd.cint), deadline, Operation.close)
+        raiseOnError(closeRes, Operation.close)
+    else:
+      # Empty data
+      if fsync:
+        u.beginChain()
+        let fsyncFut = uringFsync(u, fd.cint)
+        let closeFut = uringClose(u, fd.cint)
+        discard u.endChain()
+
+        let fsyncRes = awaitMaybeTimeout(u, fsyncFut, deadline, Operation.fsync)
+        raiseOnError(fsyncRes, Operation.fsync)
+        closed = true
+        let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+        raiseOnError(closeRes, Operation.close)
+      else:
+        closed = true
+        let closeRes =
+          awaitMaybeTimeout(u, uringClose(u, fd.cint), deadline, Operation.close)
+        raiseOnError(closeRes, Operation.close)
   finally:
     if not closed:
       discard await uringClose(u, fd.cint)

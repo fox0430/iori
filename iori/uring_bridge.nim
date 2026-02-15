@@ -52,6 +52,10 @@ type
     selfRef: UringFileIO # GC root: prevents collection while poll loop holds raw pointer
     flushScheduled: bool # Prevents duplicate callSoon scheduling
     unsubmitted: seq[uint64] # IDs not yet submitted (for failing on submit error)
+    chainActive: bool
+    chainIds: seq[uint64] # SQE IDs queued during current chain (for rollback)
+    chainFutures: seq[Future[int32]] # Futures queued during current chain
+    chainFailed: bool # Whether a getSqe returned nil during chain
 
 proc allocId(u: UringFileIO): uint64 =
   ## ID allocation
@@ -91,6 +95,11 @@ proc close*(u: UringFileIO) {.raises: [].} =
     return
   u.closed = true
 
+  if u.chainActive:
+    u.chainActive = false
+    if u.chainIds.len > 0:
+      rollbackSqes(u.ring, uint32(u.chainIds.len))
+
   stopPollLoop(u)
   u.flushScheduled = false
   u.unsubmitted.setLen(0)
@@ -111,6 +120,14 @@ proc close*(u: UringFileIO) {.raises: [].} =
   for comp in pending:
     {.cast(raises: []).}:
       comp.future.fail(err)
+
+  # Fail chain futures not in pending (e.g. from chainFailed path)
+  for fut in u.chainFutures:
+    if not fut.finished:
+      {.cast(raises: []).}:
+        fut.fail(err)
+  u.chainIds.setLen(0)
+  u.chainFutures.setLen(0)
 
   unregisterEventfd(u.ring)
   discard close(u.eventFd)
@@ -147,6 +164,8 @@ proc startPollLoop(u: UringFileIO) {.raises: [OSError].} =
 
 proc flush*(u: UringFileIO) {.raises: [].} =
   ## Flush all queued SQEs to the kernel in a single io_uring_enter syscall.
+  if u.chainActive:
+    return # Keep flushScheduled; endChain will allow flush
   u.flushScheduled = false
   if u.closed or u.unsubmitted.len == 0:
     return
@@ -175,6 +194,11 @@ proc queueSqe(u: UringFileIO, comp: Completion): Future[int32] =
   let id = u.allocId()
 
   setLastSqeUserData(u.ring, id)
+
+  if u.chainActive:
+    setLastSqeFlags(u.ring, IOSQE_IO_LINK)
+    u.chainIds.add(id)
+    u.chainFutures.add(fut)
 
   u.pending[id] = comp
   u.futureToId[cast[pointer](fut)] = id
@@ -206,6 +230,10 @@ proc uringOpen*(
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
@@ -246,6 +274,10 @@ proc uringRead*(
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
@@ -281,6 +313,10 @@ proc uringWrite*(
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
@@ -308,6 +344,10 @@ proc uringFsync*(u: UringFileIO, fd: cint): Future[int32] =
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
@@ -332,6 +372,10 @@ proc uringClose*(u: UringFileIO, fd: cint): Future[int32] =
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
@@ -359,6 +403,10 @@ proc uringStatx*(
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
@@ -394,6 +442,10 @@ proc uringStatxFd*(
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
@@ -429,6 +481,10 @@ proc uringRenameat*(
 
   let sqe = getSqe(u.ring)
   if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
     fut.fail(newException(IOError, "io_uring SQ full"))
     return fut
 
@@ -500,6 +556,67 @@ proc uringCancel*(u: UringFileIO, target: Future[int32]): Future[int32] =
 
   var comp = Completion(future: fut, kind: ckCancel)
   return queueSqe(u, comp)
+
+proc beginChain*(u: UringFileIO) =
+  ## Start a linked SQE chain. Subsequent uring* calls will have IOSQE_IO_LINK set.
+  ## Call endChain to finalize the chain.
+  if u.closed:
+    raise newException(IOError, "UringFileIO closed")
+  if u.chainActive:
+    raise newException(IOError, "chain already active")
+  u.chainActive = true
+  u.chainFailed = false
+  u.chainIds.setLen(0)
+  u.chainFutures.setLen(0)
+
+proc endChain*(u: UringFileIO): seq[Future[int32]] =
+  ## Finalize a linked SQE chain. Returns the futures for all operations in the chain.
+  ## If any getSqe failed during the chain, all SQEs are rolled back and all futures fail.
+  if not u.chainActive:
+    raise newException(IOError, "no active chain")
+  u.chainActive = false
+
+  if u.chainFutures.len == 0:
+    # Empty chain
+    return @[]
+
+  if u.chainFailed:
+    # Roll back all successfully allocated SQEs
+    if u.chainIds.len > 0:
+      rollbackSqes(u.ring, uint32(u.chainIds.len))
+      # Remove from pending/futureToId/unsubmitted
+      for id in u.chainIds:
+        var comp: Completion
+        if u.pending.pop(id, comp):
+          u.futureToId.del(cast[pointer](comp.future))
+        for i in countdown(u.unsubmitted.high, 0):
+          if u.unsubmitted[i] == id:
+            u.unsubmitted.delete(i)
+            break
+    # Fail all futures
+    let err = newException(IOError, "chain aborted: io_uring SQ full")
+    for fut in u.chainFutures:
+      if not fut.finished:
+        fut.fail(err)
+    result = u.chainFutures
+  else:
+    # Clear IOSQE_IO_LINK from the last SQE (it must not link to the next unrelated SQE)
+    if u.chainIds.len > 0:
+      clearLastSqeFlags(u.ring, IOSQE_IO_LINK)
+    result = u.chainFutures
+
+  u.chainIds.setLen(0)
+  u.chainFutures.setLen(0)
+
+  # Allow pending flush to proceed
+  if u.flushScheduled:
+    u.flushScheduled = false
+    if u.unsubmitted.len > 0:
+      u.flushScheduled = true
+      scheduleSoon(
+        proc() {.raises: [].} =
+          u.flush()
+      )
 
 proc newUringFileIO*(entries: uint32 = 256): UringFileIO {.raises: [OSError].} =
   ## Create a new UringFileIO instance. Initializes io_uring and starts poll loop.
