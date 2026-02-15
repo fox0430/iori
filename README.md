@@ -56,7 +56,6 @@ https://fox0430.github.io/iori/iori.html
 ## TODO
 
 - Linked SQE (open → read → close in a single chain)
-- Fixed files (`io_uring_register_files`)
 - SQ polling (`IORING_SETUP_SQPOLL`)
 - Additional opcodes: `READV`, `WRITEV`, `FALLOCATE`, `UNLINKAT`, `MKDIRAT`
 

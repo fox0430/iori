@@ -1063,3 +1063,266 @@ suite "uring_bridge":
     io2.close()
     doAssert io2.fixedBufsRegistered == false
     doAssert io2.fixedBufferCount == 0
+
+  test "fixed file register and unregister":
+    let path = getTempDir() / "iori_test_fixed_file_reg.txt"
+    let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+    doAssert fd >= 0
+    defer:
+      discard posix.close(fd)
+      removeFile(path)
+
+    io.registerFixedFiles(@[fd])
+    doAssert io.fixedFileCount == 1
+    io.unregisterFixedFiles()
+    doAssert io.fixedFileCount == 0
+
+  test "fixed file double register raises IOError":
+    let path = getTempDir() / "iori_test_fixed_file_double.txt"
+    let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+    doAssert fd >= 0
+    defer:
+      discard posix.close(fd)
+      removeFile(path)
+
+    io.registerFixedFiles(@[fd])
+    defer:
+      io.unregisterFixedFiles()
+
+    var raised = false
+    try:
+      io.registerFixedFiles(@[fd])
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "fixed file register on closed instance raises IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    var raised = false
+    try:
+      io2.registerFixedFiles(@[0.cint])
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "fixed file register with empty array raises IOError":
+    var raised = false
+    try:
+      io.registerFixedFiles(@[])
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "unregisterFixedFiles without registration is no-op":
+    io.unregisterFixedFiles()
+    doAssert io.fixedFileCount == 0
+
+  test "fixed file re-register after unregister":
+    let path = getTempDir() / "iori_test_fixed_file_rereg.txt"
+    let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+    doAssert fd >= 0
+    defer:
+      discard posix.close(fd)
+      removeFile(path)
+
+    io.registerFixedFiles(@[fd])
+    io.unregisterFixedFiles()
+    # Should succeed after unregister
+    io.registerFixedFiles(@[fd])
+    doAssert io.fixedFileCount == 1
+    io.unregisterFixedFiles()
+
+  test "fixed file read/write round trip":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_fixed_file_rw.bin"
+        defer:
+          removeFile(path)
+
+        let fd = posix.open(path.cstring, O_RDWR or O_CREAT or O_TRUNC, 0o644)
+        doAssert fd >= 0
+        defer:
+          discard posix.close(fd)
+
+        io.registerFixedFiles(@[fd])
+        defer:
+          io.unregisterFixedFiles()
+
+        # Write using fixed file index
+        var writeBufRef = new(seq[byte])
+        writeBufRef[] = @[byte 72, 101, 108, 108, 111] # "Hello"
+
+        let writeRes = await io.uringWriteFixedFile(
+          0.cint, addr writeBufRef[][0], uint32(writeBufRef[].len), 0'u64, writeBufRef
+        )
+        doAssert writeRes == 5, "write failed: " & $writeRes
+
+        # Read back using fixed file index
+        var readBufRef = new(seq[byte])
+        readBufRef[] = newSeq[byte](5)
+
+        let readRes = await io.uringReadFixedFile(
+          0.cint, addr readBufRef[][0], 5, 0'u64, readBufRef
+        )
+        doAssert readRes == 5, "read failed: " & $readRes
+        doAssert readBufRef[] == @[byte 72, 101, 108, 108, 111]
+
+    waitFor run()
+
+  test "fixed file chain: write + fsync":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_fixed_file_chain.bin"
+        defer:
+          removeFile(path)
+
+        let fd = posix.open(path.cstring, O_RDWR or O_CREAT or O_TRUNC, 0o644)
+        doAssert fd >= 0
+        defer:
+          discard posix.close(fd)
+
+        io.registerFixedFiles(@[fd])
+        defer:
+          io.unregisterFixedFiles()
+
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 10, 20, 30]
+
+        io.beginChain()
+        let writeFut = io.uringWriteFixedFile(
+          0.cint, addr bufRef[][0], uint32(bufRef[].len), 0'u64, bufRef
+        )
+        let fsyncFut = io.uringFsyncFixedFile(0.cint)
+        let futs = io.endChain()
+
+        doAssert futs.len == 2
+
+        let writeRes = await writeFut
+        let fsyncRes = await fsyncFut
+
+        doAssert writeRes == 3, "write failed: " & $writeRes
+        doAssert fsyncRes == 0, "fsync failed: " & $fsyncRes
+
+    waitFor run()
+
+  test "uringReadFixedFile on closed instance fails with IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var raised = false
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](64)
+        try:
+          discard
+            await io2.uringReadFixedFile(0.cint, addr bufRef[][0], 64, 0'u64, bufRef)
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "uringWriteFixedFile on closed instance fails with IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var raised = false
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](64)
+        try:
+          discard
+            await io2.uringWriteFixedFile(0.cint, addr bufRef[][0], 64, 0'u64, bufRef)
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "uringFsyncFixedFile on closed instance fails with IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var raised = false
+        try:
+          discard await io2.uringFsyncFixedFile(0.cint)
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "fixed file read/write with multiple file indices":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path1 = getTempDir() / "iori_test_fixed_file_idx0.bin"
+        let path2 = getTempDir() / "iori_test_fixed_file_idx1.bin"
+        defer:
+          removeFile(path1)
+          removeFile(path2)
+
+        let fd1 = posix.open(path1.cstring, O_RDWR or O_CREAT or O_TRUNC, 0o644)
+        let fd2 = posix.open(path2.cstring, O_RDWR or O_CREAT or O_TRUNC, 0o644)
+        doAssert fd1 >= 0
+        doAssert fd2 >= 0
+        defer:
+          discard posix.close(fd1)
+          discard posix.close(fd2)
+
+        io.registerFixedFiles(@[fd1, fd2])
+        defer:
+          io.unregisterFixedFiles()
+
+        # Write different data to each file via different indices
+        var buf1Ref = new(seq[byte])
+        buf1Ref[] = @[byte 0xAA, 0xBB]
+        var buf2Ref = new(seq[byte])
+        buf2Ref[] = @[byte 0xCC, 0xDD, 0xEE]
+
+        let w1 = await io.uringWriteFixedFile(
+          0.cint, addr buf1Ref[][0], uint32(buf1Ref[].len), 0'u64, buf1Ref
+        )
+        let w2 = await io.uringWriteFixedFile(
+          1.cint, addr buf2Ref[][0], uint32(buf2Ref[].len), 0'u64, buf2Ref
+        )
+        doAssert w1 == 2, "write to index 0 failed: " & $w1
+        doAssert w2 == 3, "write to index 1 failed: " & $w2
+
+        # Read back from each file using the opposite order
+        var read2Ref = new(seq[byte])
+        read2Ref[] = newSeq[byte](3)
+        let r2 =
+          await io.uringReadFixedFile(1.cint, addr read2Ref[][0], 3, 0'u64, read2Ref)
+        doAssert r2 == 3, "read from index 1 failed: " & $r2
+        doAssert read2Ref[] == @[byte 0xCC, 0xDD, 0xEE]
+
+        var read1Ref = new(seq[byte])
+        read1Ref[] = newSeq[byte](2)
+        let r1 =
+          await io.uringReadFixedFile(0.cint, addr read1Ref[][0], 2, 0'u64, read1Ref)
+        doAssert r1 == 2, "read from index 0 failed: " & $r1
+        doAssert read1Ref[] == @[byte 0xAA, 0xBB]
+
+    waitFor run()
+
+  test "close unregisters fixed files":
+    var io2 = newUringFileIO(32)
+
+    let path = getTempDir() / "iori_test_fixed_file_close.txt"
+    let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+    doAssert fd >= 0
+    defer:
+      discard posix.close(fd)
+      removeFile(path)
+
+    io2.registerFixedFiles(@[fd])
+    doAssert io2.fixedFilesRegistered == true
+    io2.close()
+    doAssert io2.fixedFilesRegistered == false
+    doAssert io2.fixedFileCount == 0

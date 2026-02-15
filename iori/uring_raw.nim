@@ -519,3 +519,15 @@ proc registerBuffers*(
 proc unregisterBuffers*(ring: var IoUring) =
   ## Unregister fixed buffers from the io_uring ring.
   discard ioUringRegister(ring.ringFd, IORING_UNREGISTER_BUFFERS, nil, 0)
+
+proc registerFiles*(
+    ring: var IoUring, fds: ptr cint, count: cuint
+) {.raises: [OSError].} =
+  ## Register fixed files with the io_uring ring. Raises OSError on failure.
+  let res = ioUringRegister(ring.ringFd, IORING_REGISTER_FILES, fds, count)
+  if res < 0:
+    raiseOSError(osLastError(), "io_uring_register files failed")
+
+proc unregisterFiles*(ring: var IoUring) =
+  ## Unregister fixed files from the io_uring ring.
+  discard ioUringRegister(ring.ringFd, IORING_UNREGISTER_FILES, nil, 0)

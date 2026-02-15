@@ -213,6 +213,23 @@ suite "uring_raw":
     # Unregister
     unregisterBuffers(ring)
 
+  test "registerFiles and unregisterFiles":
+    var ring = setupRing(32)
+    defer:
+      closeRing(ring)
+
+    # Create a temp file and open it
+    let path = "/tmp/iori_test_register_files.txt"
+    let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+    check fd >= 0
+    defer:
+      discard posix.close(fd)
+      discard posix.unlink(path.cstring)
+
+    var fds = [fd]
+    registerFiles(ring, addr fds[0], 1)
+    unregisterFiles(ring)
+
   test "all public sync functions callable from async":
     ## Compile-time regression: ensures the compiler's raises inference
     ## allows all uring_raw sync functions to be called from async procs.
