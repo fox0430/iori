@@ -830,3 +830,236 @@ suite "uring_bridge":
           "stale SQE was submitted to kernel: pipe contains " & $n & " bytes"
 
     waitFor run()
+
+  test "fixed buffer register and unregister":
+    io.registerFixedBuffers(@[4096, 8192])
+    doAssert io.fixedBufferCount == 2
+    doAssert io.fixedBufferSize(0) == 4096
+    doAssert io.fixedBufferSize(1) == 8192
+    doAssert io.fixedBufferAddr(0) != nil
+    doAssert io.fixedBufferAddr(1) != nil
+    io.unregisterFixedBuffers()
+    doAssert io.fixedBufferCount == 0
+
+  test "fixed buffer double register raises IOError":
+    io.registerFixedBuffers(@[4096])
+    defer:
+      io.unregisterFixedBuffers()
+
+    var raised = false
+    try:
+      io.registerFixedBuffers(@[4096])
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "fixed buffer register on closed instance raises IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    var raised = false
+    try:
+      io2.registerFixedBuffers(@[4096])
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "fixed buffer read/write round trip":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_fixed_buf.bin"
+        defer:
+          removeFile(path)
+
+        io.registerFixedBuffers(@[4096])
+        defer:
+          io.unregisterFixedBuffers()
+
+        let fdRes = await io.uringOpen(path, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fdRes >= 0
+
+        # Write data using fixed buffer
+        let writeBuf = io.fixedBufferAddr(0)
+        let data = "Hello, fixed buffers!"
+        copyMem(writeBuf, data.cstring, data.len)
+
+        let writeRes =
+          await io.uringWriteFixed(fdRes.cint, writeBuf, uint32(data.len), 0'u64, 0'u16)
+        doAssert writeRes == int32(data.len), "write failed: " & $writeRes
+
+        discard await io.uringClose(fdRes.cint)
+
+        # Read back using fixed buffer
+        let fdRes2 = await io.uringOpen(path, O_RDONLY, 0)
+        doAssert fdRes2 >= 0
+
+        # Clear the buffer first
+        zeroMem(writeBuf, 4096)
+
+        let readRes =
+          await io.uringReadFixed(fdRes2.cint, writeBuf, uint32(data.len), 0'u64, 0'u16)
+        doAssert readRes == int32(data.len), "read failed: " & $readRes
+
+        # Verify content
+        var readBack = newString(data.len)
+        copyMem(addr readBack[0], writeBuf, data.len)
+        doAssert readBack == data
+
+        discard await io.uringClose(fdRes2.cint)
+
+    waitFor run()
+
+  test "fixed buffer chain: write + fsync":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_fixed_buf_chain.bin"
+        defer:
+          removeFile(path)
+
+        io.registerFixedBuffers(@[4096])
+        defer:
+          io.unregisterFixedBuffers()
+
+        let fdRes = await io.uringOpen(path, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fdRes >= 0
+
+        let writeBuf = io.fixedBufferAddr(0)
+        let data = "chained fixed write"
+        copyMem(writeBuf, data.cstring, data.len)
+
+        io.beginChain()
+        let writeFut =
+          io.uringWriteFixed(fdRes.cint, writeBuf, uint32(data.len), 0'u64, 0'u16)
+        let fsyncFut = io.uringFsync(fdRes.cint)
+        let futs = io.endChain()
+
+        doAssert futs.len == 2
+
+        let writeRes = await writeFut
+        let fsyncRes = await fsyncFut
+
+        doAssert writeRes == int32(data.len), "write failed: " & $writeRes
+        doAssert fsyncRes == 0, "fsync failed: " & $fsyncRes
+
+        discard await io.uringClose(fdRes.cint)
+
+    waitFor run()
+
+  test "uringReadFixed on closed instance fails with IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var raised = false
+        try:
+          discard await io2.uringReadFixed(0.cint, nil, 64, 0'u64, 0'u16)
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "uringWriteFixed on closed instance fails with IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var raised = false
+        try:
+          discard await io2.uringWriteFixed(0.cint, nil, 64, 0'u64, 0'u16)
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "fixed buffer register with empty sizes raises IOError":
+    var raised = false
+    try:
+      io.registerFixedBuffers(@[])
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "fixed buffer register with zero size raises IOError":
+    var raised = false
+    try:
+      io.registerFixedBuffers(@[0])
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "fixed buffer register with negative size raises IOError":
+    var raised = false
+    try:
+      io.registerFixedBuffers(@[-1])
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "unregisterFixedBuffers without registration is no-op":
+    io.unregisterFixedBuffers()
+    doAssert io.fixedBufferCount == 0
+
+  test "fixed buffer re-register after unregister":
+    io.registerFixedBuffers(@[4096])
+    io.unregisterFixedBuffers()
+    # Should succeed after unregister
+    io.registerFixedBuffers(@[8192])
+    doAssert io.fixedBufferCount == 1
+    doAssert io.fixedBufferSize(0) == 8192
+    io.unregisterFixedBuffers()
+
+  test "fixed buffer read/write with multiple buffer indices":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_fixed_multi_idx.bin"
+        defer:
+          removeFile(path)
+
+        io.registerFixedBuffers(@[4096, 4096])
+        defer:
+          io.unregisterFixedBuffers()
+
+        let fdRes = await io.uringOpen(path, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fdRes >= 0
+
+        # Write using buffer index 1
+        let buf1 = io.fixedBufferAddr(1)
+        let data = "buffer index 1"
+        copyMem(buf1, data.cstring, data.len)
+
+        let writeRes =
+          await io.uringWriteFixed(fdRes.cint, buf1, uint32(data.len), 0'u64, 1'u16)
+        doAssert writeRes == int32(data.len), "write failed: " & $writeRes
+
+        discard await io.uringClose(fdRes.cint)
+
+        # Read back using buffer index 0
+        let fdRes2 = await io.uringOpen(path, O_RDONLY, 0)
+        doAssert fdRes2 >= 0
+
+        let buf0 = io.fixedBufferAddr(0)
+        zeroMem(buf0, 4096)
+
+        let readRes =
+          await io.uringReadFixed(fdRes2.cint, buf0, uint32(data.len), 0'u64, 0'u16)
+        doAssert readRes == int32(data.len), "read failed: " & $readRes
+
+        var readBack = newString(data.len)
+        copyMem(addr readBack[0], buf0, data.len)
+        doAssert readBack == data
+
+        discard await io.uringClose(fdRes2.cint)
+
+    waitFor run()
+
+  test "close unregisters fixed buffers":
+    var io2 = newUringFileIO(32)
+    io2.registerFixedBuffers(@[4096])
+    doAssert io2.fixedBufsRegistered == true
+    io2.close()
+    doAssert io2.fixedBufsRegistered == false
+    doAssert io2.fixedBufferCount == 0

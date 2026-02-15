@@ -56,6 +56,8 @@ type
     chainIds: seq[uint64] # SQE IDs queued during current chain (for rollback)
     chainFutures: seq[Future[int32]] # Futures queued during current chain
     chainFailed: bool # Whether a getSqe returned nil during chain
+    fixedBufs: seq[seq[byte]] # Registered fixed buffers (GC root)
+    fixedBufsRegistered: bool
 
 proc allocId(u: UringFileIO): uint64 =
   ## ID allocation
@@ -128,6 +130,11 @@ proc close*(u: UringFileIO) {.raises: [].} =
         fut.fail(err)
   u.chainIds.setLen(0)
   u.chainFutures.setLen(0)
+
+  if u.fixedBufsRegistered:
+    unregisterBuffers(u.ring)
+    u.fixedBufsRegistered = false
+    u.fixedBufs.setLen(0)
 
   unregisterEventfd(u.ring)
   discard close(u.eventFd)
@@ -648,3 +655,137 @@ proc newUringFileIO*(entries: uint32 = 256): UringFileIO {.raises: [OSError].} =
     discard close(efd)
     closeRing(ring)
     raise e
+
+# Fixed buffers
+
+proc registerFixedBuffers*(
+    u: UringFileIO, sizes: openArray[int]
+) {.raises: [IOError].} =
+  ## Register fixed buffers with the kernel. `sizes` specifies the size of each buffer.
+  ## Buffers are allocated and managed by UringFileIO.
+  if u.closed:
+    raise newException(IOError, "UringFileIO closed")
+  if u.fixedBufsRegistered:
+    raise newException(IOError, "fixed buffers already registered")
+  if sizes.len == 0:
+    raise newException(IOError, "sizes must not be empty")
+  for s in sizes:
+    if s <= 0:
+      raise newException(IOError, "buffer size must be positive")
+
+  u.fixedBufs = newSeq[seq[byte]](sizes.len)
+  var iovecs = newSeq[IOVec](sizes.len)
+  for i in 0 ..< sizes.len:
+    u.fixedBufs[i] = newSeq[byte](sizes[i])
+    iovecs[i].iov_base = addr u.fixedBufs[i][0]
+    iovecs[i].iov_len = csize_t(sizes[i])
+
+  try:
+    registerBuffers(u.ring, addr iovecs[0], cuint(sizes.len))
+  except OSError as e:
+    u.fixedBufs.setLen(0)
+    raise newException(IOError, "registerFixedBuffers failed: " & e.msg)
+
+  u.fixedBufsRegistered = true
+
+proc unregisterFixedBuffers*(u: UringFileIO) =
+  ## Unregister fixed buffers from the kernel and free them.
+  if not u.fixedBufsRegistered:
+    return
+  unregisterBuffers(u.ring)
+  u.fixedBufsRegistered = false
+  u.fixedBufs.setLen(0)
+
+proc fixedBufferCount*(u: UringFileIO): int =
+  ## Return the number of registered fixed buffers.
+  u.fixedBufs.len
+
+proc fixedBufferAddr*(u: UringFileIO, index: int): pointer =
+  ## Return the address of a registered fixed buffer.
+  addr u.fixedBufs[index][0]
+
+proc fixedBufferSize*(u: UringFileIO, index: int): int =
+  ## Return the size of a registered fixed buffer.
+  u.fixedBufs[index].len
+
+proc uringReadFixed*(
+    u: UringFileIO,
+    fd: cint,
+    buf: pointer,
+    size: uint32,
+    offset: uint64,
+    bufIndex: uint16,
+): Future[int32] =
+  ## Submit READ_FIXED operation using a pre-registered fixed buffer.
+  ## `buf` must point into the registered buffer at `bufIndex`.
+  ## No bufRef needed — UringFileIO owns the buffer.
+  let fut = newFuture[int32]("uringReadFixed")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
+  let sqe = getSqe(u.ring)
+  if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
+    fut.fail(newException(IOError, "io_uring SQ full"))
+    return fut
+
+  sqe.opcode = IORING_OP_READ_FIXED
+  sqe.fd = fd
+  sqe.`addr` = cast[uint64](buf)
+  sqe.len = size
+  sqe.off = offset
+  sqe.bufInfo = bufIndex
+
+  var comp = Completion(future: fut, kind: ckRead)
+  return queueSqe(u, comp)
+
+proc uringWriteFixed*(
+    u: UringFileIO,
+    fd: cint,
+    buf: pointer,
+    size: uint32,
+    offset: uint64,
+    bufIndex: uint16,
+): Future[int32] =
+  ## Submit WRITE_FIXED operation using a pre-registered fixed buffer.
+  ## `buf` must point into the registered buffer at `bufIndex`.
+  ## No bufRef needed — UringFileIO owns the buffer.
+  let fut = newFuture[int32]("uringWriteFixed")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
+  let sqe = getSqe(u.ring)
+  if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
+    fut.fail(newException(IOError, "io_uring SQ full"))
+    return fut
+
+  sqe.opcode = IORING_OP_WRITE_FIXED
+  sqe.fd = fd
+  sqe.`addr` = cast[uint64](buf)
+  sqe.len = size
+  sqe.off = offset
+  sqe.bufInfo = bufIndex
+
+  var comp = Completion(future: fut, kind: ckWrite)
+  return queueSqe(u, comp)
