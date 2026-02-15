@@ -22,7 +22,7 @@ proc threadBasicWorker(id: int) {.thread.} =
 
       let content = "thread " & $id & " data"
       await io.writeFileString(path, content)
-      let readResult = await io.readFileString(path, 4096)
+      let readResult = await io.readFileString(path)
       doAssert readResult == content
 
   try:
@@ -59,7 +59,7 @@ proc threadConcurrentWorker(id: int) {.thread.} =
       # Read all files concurrently and verify
       var readFuts: seq[Future[string]]
       for i in 0 ..< numFiles:
-        readFuts.add(io.readFileString(paths[i], 4096))
+        readFuts.add(io.readFileString(paths[i]))
       for i in 0 ..< numFiles:
         let got = await readFuts[i]
         let expected = "thread " & $id & " file " & $i
