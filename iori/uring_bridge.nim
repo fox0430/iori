@@ -58,6 +58,8 @@ type
     chainFailed: bool # Whether a getSqe returned nil during chain
     fixedBufs: seq[seq[byte]] # Registered fixed buffers (GC root)
     fixedBufsRegistered: bool
+    fixedFiles: seq[cint] # Registered fixed file descriptors (copy)
+    fixedFilesRegistered: bool
 
 proc allocId(u: UringFileIO): uint64 =
   ## ID allocation
@@ -130,6 +132,11 @@ proc close*(u: UringFileIO) {.raises: [].} =
         fut.fail(err)
   u.chainIds.setLen(0)
   u.chainFutures.setLen(0)
+
+  if u.fixedFilesRegistered:
+    unregisterFiles(u.ring)
+    u.fixedFilesRegistered = false
+    u.fixedFiles.setLen(0)
 
   if u.fixedBufsRegistered:
     unregisterBuffers(u.ring)
@@ -788,4 +795,149 @@ proc uringWriteFixed*(
   sqe.bufInfo = bufIndex
 
   var comp = Completion(future: fut, kind: ckWrite)
+  return queueSqe(u, comp)
+
+# Fixed files
+
+proc registerFixedFiles*(u: UringFileIO, fds: openArray[cint]) {.raises: [IOError].} =
+  ## Register fixed files with the kernel. `fds` are file descriptors opened by the caller.
+  ## The caller retains ownership of the fds (open/close responsibility).
+  if u.closed:
+    raise newException(IOError, "UringFileIO closed")
+  if u.fixedFilesRegistered:
+    raise newException(IOError, "fixed files already registered")
+  if fds.len == 0:
+    raise newException(IOError, "fds must not be empty")
+
+  u.fixedFiles = @fds # Copy
+  try:
+    registerFiles(u.ring, addr u.fixedFiles[0], cuint(fds.len))
+  except OSError as e:
+    u.fixedFiles.setLen(0)
+    raise newException(IOError, "registerFixedFiles failed: " & e.msg)
+
+  u.fixedFilesRegistered = true
+
+proc unregisterFixedFiles*(u: UringFileIO) =
+  ## Unregister fixed files from the kernel. Does not close the fds.
+  if not u.fixedFilesRegistered:
+    return
+  unregisterFiles(u.ring)
+  u.fixedFilesRegistered = false
+  u.fixedFiles.setLen(0)
+
+proc fixedFileCount*(u: UringFileIO): int =
+  ## Return the number of registered fixed files.
+  u.fixedFiles.len
+
+proc uringReadFixedFile*(
+    u: UringFileIO,
+    fileIndex: cint,
+    buf: pointer,
+    size: uint32,
+    offset: uint64,
+    bufRef: ref seq[byte],
+): Future[int32] =
+  ## Submit READ operation using a fixed file index.
+  ## `fileIndex` is the index into the registered file table (not a real fd).
+  ## bufRef keeps the buffer GC-rooted until completion.
+  let fut = newFuture[int32]("uringReadFixedFile")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
+  let sqe = getSqe(u.ring)
+  if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
+    fut.fail(newException(IOError, "io_uring SQ full"))
+    return fut
+
+  sqe.opcode = IORING_OP_READ
+  sqe.flags = IOSQE_FIXED_FILE
+  sqe.fd = fileIndex
+  sqe.`addr` = cast[uint64](buf)
+  sqe.len = size
+  sqe.off = offset
+
+  var comp = Completion(future: fut, kind: ckRead, bufRef: bufRef)
+  return queueSqe(u, comp)
+
+proc uringWriteFixedFile*(
+    u: UringFileIO,
+    fileIndex: cint,
+    buf: pointer,
+    size: uint32,
+    offset: uint64,
+    bufRef: ref seq[byte],
+): Future[int32] =
+  ## Submit WRITE operation using a fixed file index.
+  ## `fileIndex` is the index into the registered file table (not a real fd).
+  ## bufRef keeps the buffer GC-rooted until completion.
+  let fut = newFuture[int32]("uringWriteFixedFile")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
+  let sqe = getSqe(u.ring)
+  if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
+    fut.fail(newException(IOError, "io_uring SQ full"))
+    return fut
+
+  sqe.opcode = IORING_OP_WRITE
+  sqe.flags = IOSQE_FIXED_FILE
+  sqe.fd = fileIndex
+  sqe.`addr` = cast[uint64](buf)
+  sqe.len = size
+  sqe.off = offset
+
+  var comp = Completion(future: fut, kind: ckWrite, bufRef: bufRef)
+  return queueSqe(u, comp)
+
+proc uringFsyncFixedFile*(u: UringFileIO, fileIndex: cint): Future[int32] =
+  ## Submit FSYNC operation using a fixed file index.
+  ## `fileIndex` is the index into the registered file table (not a real fd).
+  let fut = newFuture[int32]("uringFsyncFixedFile")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
+  let sqe = getSqe(u.ring)
+  if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
+    fut.fail(newException(IOError, "io_uring SQ full"))
+    return fut
+
+  sqe.opcode = IORING_OP_FSYNC
+  sqe.flags = IOSQE_FIXED_FILE
+  sqe.fd = fileIndex
+
+  var comp = Completion(future: fut, kind: ckFsync)
   return queueSqe(u, comp)
