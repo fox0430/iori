@@ -114,14 +114,20 @@ proc readFile*(
       raiseOnError(closeRes, Operation.close)
       return @[]
 
-    var buf = newSeq[byte](fileSize)
+    var bufRef = new(seq[byte])
+    bufRef[] = newSeq[byte](fileSize)
     var totalRead = 0
     while totalRead < fileSize:
       let remaining = min(fileSize - totalRead, int(high(uint32)))
       let readRes = awaitMaybeTimeout(
         u,
         uringRead(
-          u, fd.cint, addr buf[totalRead], uint32(remaining), uint64(totalRead), buf
+          u,
+          fd.cint,
+          addr bufRef[][totalRead],
+          uint32(remaining),
+          uint64(totalRead),
+          bufRef,
         ),
         deadline,
         Operation.read,
@@ -131,16 +137,16 @@ proc readFile*(
         let closeRes = await uringClose(u, fd.cint)
         raiseOnError(readRes, Operation.read)
         raiseOnError(closeRes, Operation.close)
-        buf.setLen(totalRead)
-        return buf
+        bufRef[].setLen(totalRead)
+        return bufRef[]
       totalRead += readRes.int
 
     closed = true
     let closeRes = await uringClose(u, fd.cint)
     raiseOnError(closeRes, Operation.close)
 
-    buf.setLen(totalRead)
-    return buf
+    bufRef[].setLen(totalRead)
+    return bufRef[]
   finally:
     if not closed:
       discard await uringClose(u, fd.cint)
@@ -171,19 +177,20 @@ proc writeFile*(
   var closed = false
   try:
     if data.len > 0:
-      var dataCopy = data
+      var dataRef = new(seq[byte])
+      dataRef[] = data
       var written = 0
-      while written < dataCopy.len:
-        let remaining = min(dataCopy.len - written, int(high(uint32)))
+      while written < dataRef[].len:
+        let remaining = min(dataRef[].len - written, int(high(uint32)))
         let writeRes = awaitMaybeTimeout(
           u,
           uringWrite(
             u,
             fd.cint,
-            addr dataCopy[written],
+            addr dataRef[][written],
             uint32(remaining),
             uint64(written),
-            dataCopy,
+            dataRef,
           ),
           deadline,
           Operation.write,

@@ -376,8 +376,9 @@ suite "uring_file_io":
           discard posix.close(readFd)
           discard posix.close(writeFd)
 
-        var buf = newSeq[byte](64)
-        let readFut = io.uringRead(readFd, addr buf[0], 64, 0'u64, buf)
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](64)
+        let readFut = io.uringRead(readFd, addr bufRef[][0], 64, 0'u64, bufRef)
         io.flush()
 
         # Manually replicate the awaitOrTimeout pattern

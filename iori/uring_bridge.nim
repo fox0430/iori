@@ -33,7 +33,7 @@ type
   Completion = object
     future: Future[int32]
     kind: CompletionKind
-    bufRef: seq[byte] # GC root for buffer
+    bufRef: ref seq[byte] # GC root for buffer
     strRef: ref string
       # GC root for path string (ref ensures stable cstring through copies)
     strRef2: ref string # GC root for second path string (rename)
@@ -229,7 +229,7 @@ proc uringRead*(
     buf: pointer,
     size: uint32,
     offset: uint64,
-    bufRef: seq[byte],
+    bufRef: ref seq[byte],
 ): Future[int32] =
   ## Submit READ operation. Returns Future with bytes read or negative errno.
   ## bufRef keeps the buffer GC-rooted until completion.
@@ -264,7 +264,7 @@ proc uringWrite*(
     buf: pointer,
     size: uint32,
     offset: uint64,
-    bufRef: seq[byte],
+    bufRef: ref seq[byte],
 ): Future[int32] =
   ## Submit WRITE operation. Returns Future with bytes written or negative errno.
   ## bufRef keeps the buffer GC-rooted until completion.
