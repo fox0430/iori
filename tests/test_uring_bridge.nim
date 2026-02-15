@@ -106,8 +106,9 @@ suite "uring_bridge":
         defer:
           discard posix.close(fd)
 
-        var buf = newSeq[byte](4096)
-        let fut = io2.uringRead(fd, addr buf[0], 4096, 0'u64, buf)
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](4096)
+        let fut = io2.uringRead(fd, addr bufRef[][0], 4096, 0'u64, bufRef)
 
         # Close immediately — flush has not fired yet, SQE is unsubmitted
         io2.close()
@@ -155,8 +156,9 @@ suite "uring_bridge":
         doAssert fd2 >= 0
 
         # Queue a read and a close in the same batch
-        var buf = newSeq[byte](16)
-        let futRead = io.uringRead(fd2, addr buf[0], 16, 0'u64, buf)
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](16)
+        let futRead = io.uringRead(fd2, addr bufRef[][0], 16, 0'u64, bufRef)
         let futClose1 = io.uringClose(fd1)
 
         let bytesRead = await futRead
@@ -227,6 +229,47 @@ suite "uring_bridge":
 
     waitFor run()
 
+  test "write buffer survives after queueing (regression: dangling bufRef)":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_dangling_buf.bin"
+        defer:
+          removeFile(path)
+
+        let fdRes = await io.uringOpen(path, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fdRes >= 0
+
+        # Queue write without awaiting — SQE holds raw pointer into bufRef
+        var writeFut: Future[int32]
+        block:
+          var bufRef = new(seq[byte])
+          bufRef[] = @[byte 1, 2, 3, 4, 5]
+          writeFut = io.uringWrite(fdRes.cint, addr bufRef[][0], 5, 0'u64, bufRef)
+          # bufRef goes out of scope here; Completion must keep the data alive
+
+        # Allocate junk to overwrite freed memory.
+        # If the buffer pointer was dangling, the kernel writes garbage to the file.
+        var junk: seq[seq[byte]]
+        for i in 0 ..< 1000:
+          var j = newSeq[byte](8)
+          for k in 0 ..< j.len:
+            j[k] = 0xFF'u8
+          junk.add(j)
+
+        let writeRes = await writeFut
+        doAssert writeRes == 5, "write failed with " & $writeRes & " (expected 5)"
+        discard await io.uringClose(fdRes.cint)
+
+        # Read back with posix and verify the data is correct
+        let rfd = posix.open(path.cstring, O_RDONLY)
+        doAssert rfd >= 0
+        var readBuf: array[5, byte]
+        doAssert posix.read(rfd, addr readBuf[0], 5) == 5
+        discard posix.close(rfd)
+        doAssert readBuf == [byte 1, 2, 3, 4, 5]
+
+    waitFor run()
+
   test "uringRenameat renames file":
     proc run() {.async.} =
       {.cast(gcsafe).}:
@@ -270,8 +313,10 @@ suite "uring_bridge":
         doAssert fdRes >= 0
         discard posix.close(fdRes.cint)
 
-        var buf = newSeq[byte](64)
-        let readRes = await io.uringRead(fdRes.cint, addr buf[0], 64, 0'u64, buf)
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](64)
+        let readRes =
+          await io.uringRead(fdRes.cint, addr bufRef[][0], 64, 0'u64, bufRef)
         doAssert readRes == -9 # -EBADF
 
     waitFor run()
@@ -291,9 +336,10 @@ suite "uring_bridge":
         doAssert raised
 
         raised = false
-        var buf = newSeq[byte](64)
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](64)
         try:
-          discard await io2.uringRead(0.cint, addr buf[0], 64, 0'u64, buf)
+          discard await io2.uringRead(0.cint, addr bufRef[][0], 64, 0'u64, bufRef)
         except IOError:
           raised = true
         doAssert raised
@@ -359,8 +405,9 @@ suite "uring_bridge":
           discard posix.close(readFd)
           discard posix.close(writeFd)
 
-        var buf = newSeq[byte](64)
-        let readFut = io.uringRead(readFd, addr buf[0], 64, 0'u64, buf)
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](64)
+        let readFut = io.uringRead(readFd, addr bufRef[][0], 64, 0'u64, bufRef)
         io.flush()
 
         # Cancel the blocked read
@@ -381,8 +428,9 @@ suite "uring_bridge":
         defer:
           discard posix.close(fd)
 
-        var buf = newSeq[byte](64)
-        let readFut = io.uringRead(fd, addr buf[0], 64, 0'u64, buf)
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](64)
+        let readFut = io.uringRead(fd, addr bufRef[][0], 64, 0'u64, bufRef)
 
         # Cancel before flush — should be a local cancel
         let cancelRes = await io.uringCancel(readFut)
