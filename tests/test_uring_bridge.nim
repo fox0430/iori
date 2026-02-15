@@ -321,6 +321,29 @@ suite "uring_bridge":
 
     waitFor run()
 
+  test "uringFsync succeeds on regular file":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_fsync.bin"
+        defer:
+          removeFile(path)
+
+        let fdRes = await io.uringOpen(path, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fdRes >= 0
+
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 1, 2, 3, 4, 5]
+        let writeRes =
+          await io.uringWrite(fdRes.cint, addr bufRef[][0], 5, 0'u64, bufRef)
+        doAssert writeRes == 5
+
+        let fsyncRes = await io.uringFsync(fdRes.cint)
+        doAssert fsyncRes == 0
+
+        discard await io.uringClose(fdRes.cint)
+
+    waitFor run()
+
   test "API calls after close fail with IOError":
     var io2 = newUringFileIO(32)
     io2.close()

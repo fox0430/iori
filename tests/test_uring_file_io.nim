@@ -418,6 +418,40 @@ suite "uring_file_io":
 
     waitFor run()
 
+  test "writeFile on FIFO with large data times out during write step":
+    ## Open a FIFO reader so the write-side open succeeds quickly. Then write
+    ## data larger than the pipe buffer (64KB default), which blocks the kernel
+    ## write. With timeoutMs=1, the deadline expires during or before the write
+    ## step, exercising the near-expiry / already-expired (ms <= 0) path in
+    ## awaitOrTimeout.
+    let path = getTempDir() / "iori_test_fifo_write_step_timeout"
+    defer:
+      removeFile(path)
+
+    doAssert mkfifo(path.cstring, 0o644) == 0
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # Open reader with O_NONBLOCK so writer's open doesn't block
+        let readerFd = posix.open(path.cstring, O_RDONLY or O_NONBLOCK)
+        doAssert readerFd >= 0
+        defer:
+          discard posix.close(readerFd)
+
+        # 128KB exceeds default pipe buffer (64KB), so write blocks in kernel
+        var bigData = newSeq[byte](128 * 1024)
+        for i in 0 ..< bigData.len:
+          bigData[i] = byte(i mod 256)
+
+        var raised = false
+        try:
+          await io.writeFile(path, bigData, timeoutMs = 1, fsync = false)
+        except TimeoutError:
+          raised = true
+        doAssert raised, "should have raised TimeoutError"
+
+    waitFor run()
+
   test "readFile on unreadable file with timeout raises IOError":
     ## statx succeeds (file exists, size > 0) but open fails with EACCES.
     ## IOError must be raised — the timeout wrapper on uringOpen must not mask it.
