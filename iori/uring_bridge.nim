@@ -480,6 +480,7 @@ proc uringCancel*(u: UringFileIO, target: Future[int32]): Future[int32] =
 
   if unsubIdx >= 0:
     u.unsubmitted.delete(unsubIdx)
+    nopifySqe(u.ring, targetId)
     var comp: Completion
     if u.pending.pop(targetId, comp):
       u.futureToId.del(cast[pointer](comp.future))

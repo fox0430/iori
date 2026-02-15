@@ -466,6 +466,21 @@ proc advanceCq*(ring: var IoUring) =
   let head = ring.cqHead[] + 1
   atomicStoreRelease(ring.cqHead, head)
 
+proc nopifySqe*(ring: var IoUring, userData: uint64) =
+  ## Replace an unsubmitted SQE with NOP by its userData.
+  ## Prevents the kernel from executing a locally-cancelled operation.
+  let tail = atomicLoadAcquire(ring.sqTail)
+  let mask = ring.sqMask[]
+  var idx = tail
+  while idx != ring.sqLocalTail:
+    let sqeIdx = idx and mask
+    if ring.sqes[sqeIdx].userData == userData:
+      zeroMem(addr ring.sqes[sqeIdx], sizeof(IoUringSqe))
+      ring.sqes[sqeIdx].opcode = IORING_OP_NOP
+      ring.sqes[sqeIdx].userData = userData
+      return
+    idx += 1
+
 proc registerEventfd*(ring: var IoUring, efd: cint) {.raises: [OSError].} =
   ## Register an eventfd with the io_uring ring. Raises OSError on failure.
   var efdVal = cint(efd)
