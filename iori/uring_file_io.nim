@@ -310,3 +310,246 @@ proc writeFileString*(
   if data.len > 0:
     copyMem(addr bytes[0], unsafeAddr data[0], data.len)
   await writeFile(u, path, bytes, timeoutMs, fsync)
+
+# Direct descriptor variants
+
+proc readFileDirect*(
+    u: UringFileIO, path: string, timeoutMs: int = 0
+): Future[seq[byte]] {.async.} =
+  ## Read entire file using direct descriptors. Requires `registerFixedFileSlots`.
+  ## Chains openDirect → readFixedFile → closeDirect in a single submission (2 syscalls).
+  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  let deadline =
+    if timeoutMs > 0:
+      getMonoTime() + initDuration(milliseconds = timeoutMs)
+    else:
+      default(MonoTime)
+
+  # Get file size via path-based statx
+  var stx = new(Statx)
+  let statxRes = awaitMaybeTimeout(
+    u, uringStatx(u, path, 0.cint, STATX_SIZE, stx), deadline, Operation.statx
+  )
+  raiseOnError(statxRes, Operation.statx)
+  let fileSize = int(stx.stxSize)
+
+  if fileSize <= 0:
+    return @[]
+
+  let slot = allocFixedFileSlot(u)
+  var slotHasFile = false
+
+  try:
+    if fileSize <= int(high(uint32)):
+      # Single chain: openDirect → readFixedFile → closeDirect
+      var bufRef = new(seq[byte])
+      bufRef[] = newSeq[byte](fileSize)
+
+      u.beginChain()
+      let openFut = u.uringOpenDirect(path, O_RDONLY, 0, slot)
+      let readFut = uringReadFixedFile(
+        u, slot.cint, addr bufRef[][0], uint32(fileSize), 0'u64, bufRef
+      )
+      let closeFut = u.uringCloseDirect(slot)
+      discard u.endChain()
+
+      let openRes = awaitMaybeTimeout(u, openFut, deadline, Operation.open)
+      if openRes == 0:
+        slotHasFile = true
+      raiseOnError(openRes, Operation.open)
+
+      let readRes = awaitMaybeTimeout(u, readFut, deadline, Operation.read)
+      raiseOnError(readRes, Operation.read)
+      let totalRead = readRes.int
+      bufRef[].setLen(totalRead)
+
+      let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+      if closeRes == 0:
+        slotHasFile = false
+      raiseOnError(closeRes, Operation.close)
+      return bufRef[]
+    else:
+      # Multi-read: openDirect (await), loop reads, closeDirect
+      let openRes = awaitMaybeTimeout(
+        u, u.uringOpenDirect(path, O_RDONLY, 0, slot), deadline, Operation.open
+      )
+      if openRes == 0:
+        slotHasFile = true
+      raiseOnError(openRes, Operation.open)
+
+      var bufRef = new(seq[byte])
+      bufRef[] = newSeq[byte](fileSize)
+      var totalRead = 0
+
+      while totalRead < fileSize:
+        let remaining = min(fileSize - totalRead, int(high(uint32)))
+        let readRes = awaitMaybeTimeout(
+          u,
+          uringReadFixedFile(
+            u,
+            slot.cint,
+            addr bufRef[][totalRead],
+            uint32(remaining),
+            uint64(totalRead),
+            bufRef,
+          ),
+          deadline,
+          Operation.read,
+        )
+        if readRes <= 0:
+          raiseOnError(readRes, Operation.read)
+          bufRef[].setLen(totalRead)
+          break
+        totalRead += readRes.int
+
+      let closeRes =
+        awaitMaybeTimeout(u, u.uringCloseDirect(slot), deadline, Operation.close)
+      if closeRes == 0:
+        slotHasFile = false
+      raiseOnError(closeRes, Operation.close)
+
+      bufRef[].setLen(totalRead)
+      return bufRef[]
+  finally:
+    if slotHasFile:
+      discard await u.uringCloseDirect(slot)
+    freeFixedFileSlot(u, slot)
+
+proc writeFileDirect*(
+    u: UringFileIO,
+    path: string,
+    data: seq[byte],
+    timeoutMs: int = 0,
+    fsync: bool = true,
+): Future[void] {.async.} =
+  ## Write data to file using direct descriptors. Requires `registerFixedFileSlots`.
+  ## Chains openDirect → writeFixedFile → fsyncFixedFile → closeDirect in a single
+  ## submission (1 syscall for data ≤ 4GB).
+  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  let deadline =
+    if timeoutMs > 0:
+      getMonoTime() + initDuration(milliseconds = timeoutMs)
+    else:
+      default(MonoTime)
+
+  let flags = O_WRONLY or O_CREAT or O_TRUNC
+  let slot = allocFixedFileSlot(u)
+  var slotHasFile = false
+
+  try:
+    if data.len <= int(high(uint32)):
+      # Single chain: openDirect → (write →) (fsync →) closeDirect
+      var dataRef: ref seq[byte]
+      if data.len > 0:
+        dataRef = new(seq[byte])
+        dataRef[] = data
+
+      u.beginChain()
+      let openFut = u.uringOpenDirect(path, flags.cint, 0o644, slot)
+      var writeFut: Future[int32]
+      if data.len > 0:
+        writeFut = uringWriteFixedFile(
+          u, slot.cint, addr dataRef[][0], uint32(data.len), 0'u64, dataRef
+        )
+      var fsyncFut: Future[int32]
+      if fsync:
+        fsyncFut = uringFsyncFixedFile(u, slot.cint)
+      let closeFut = u.uringCloseDirect(slot)
+      discard u.endChain()
+
+      let openRes = awaitMaybeTimeout(u, openFut, deadline, Operation.open)
+      if openRes == 0:
+        slotHasFile = true
+      raiseOnError(openRes, Operation.open)
+
+      if data.len > 0:
+        let writeRes = awaitMaybeTimeout(u, writeFut, deadline, Operation.write)
+        raiseOnError(writeRes, Operation.write)
+        if writeRes <= 0:
+          raise newException(IOError, "write stalled: 0 bytes written")
+
+      if fsync:
+        let fsyncRes = awaitMaybeTimeout(u, fsyncFut, deadline, Operation.fsync)
+        raiseOnError(fsyncRes, Operation.fsync)
+
+      let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+      if closeRes == 0:
+        slotHasFile = false
+      raiseOnError(closeRes, Operation.close)
+    else:
+      # Multi-write: openDirect (await), loop writes, then (fsync →) closeDirect
+      let openRes = awaitMaybeTimeout(
+        u, u.uringOpenDirect(path, flags.cint, 0o644, slot), deadline, Operation.open
+      )
+      if openRes == 0:
+        slotHasFile = true
+      raiseOnError(openRes, Operation.open)
+
+      var dataRef = new(seq[byte])
+      dataRef[] = data
+      var written = 0
+      while written < dataRef[].len:
+        let remaining = min(dataRef[].len - written, int(high(uint32)))
+        let writeRes = awaitMaybeTimeout(
+          u,
+          uringWriteFixedFile(
+            u,
+            slot.cint,
+            addr dataRef[][written],
+            uint32(remaining),
+            uint64(written),
+            dataRef,
+          ),
+          deadline,
+          Operation.write,
+        )
+        if writeRes <= 0:
+          raiseOnError(writeRes, Operation.write)
+          raise newException(IOError, "write stalled: 0 bytes written")
+        written += writeRes.int
+
+      if fsync:
+        u.beginChain()
+        let fsyncFut = uringFsyncFixedFile(u, slot.cint)
+        let closeFut = u.uringCloseDirect(slot)
+        discard u.endChain()
+
+        let fsyncRes = awaitMaybeTimeout(u, fsyncFut, deadline, Operation.fsync)
+        raiseOnError(fsyncRes, Operation.fsync)
+        let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+        if closeRes == 0:
+          slotHasFile = false
+        raiseOnError(closeRes, Operation.close)
+      else:
+        let closeRes =
+          awaitMaybeTimeout(u, u.uringCloseDirect(slot), deadline, Operation.close)
+        if closeRes == 0:
+          slotHasFile = false
+        raiseOnError(closeRes, Operation.close)
+  finally:
+    if slotHasFile:
+      discard await u.uringCloseDirect(slot)
+    freeFixedFileSlot(u, slot)
+
+proc readFileStringDirect*(
+    u: UringFileIO, path: string, timeoutMs: int = 0
+): Future[string] {.async.} =
+  ## Read entire file as string using direct descriptors.
+  ## Requires `registerFixedFileSlots`.
+  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  let bytes = await readFileDirect(u, path, timeoutMs)
+  var s = newString(bytes.len)
+  if bytes.len > 0:
+    copyMem(addr s[0], unsafeAddr bytes[0], bytes.len)
+  return s
+
+proc writeFileStringDirect*(
+    u: UringFileIO, path: string, data: string, timeoutMs: int = 0, fsync: bool = true
+): Future[void] {.async.} =
+  ## Write string to file using direct descriptors.
+  ## Requires `registerFixedFileSlots`.
+  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  var bytes = newSeq[byte](data.len)
+  if data.len > 0:
+    copyMem(addr bytes[0], unsafeAddr data[0], data.len)
+  await writeFileDirect(u, path, bytes, timeoutMs, fsync)

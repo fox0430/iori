@@ -60,6 +60,7 @@ type
     fixedBufsRegistered: bool
     fixedFiles: seq[cint] # Registered fixed file descriptors (copy)
     fixedFilesRegistered: bool
+    fixedFileSlotsFree: seq[int32] # Direct open: free slot stack
 
 proc allocId(u: UringFileIO): uint64 =
   ## ID allocation
@@ -137,6 +138,7 @@ proc close*(u: UringFileIO) {.raises: [].} =
     unregisterFiles(u.ring)
     u.fixedFilesRegistered = false
     u.fixedFiles.setLen(0)
+    u.fixedFileSlotsFree.setLen(0)
 
   if u.fixedBufsRegistered:
     unregisterBuffers(u.ring)
@@ -825,6 +827,7 @@ proc unregisterFixedFiles*(u: UringFileIO) =
   unregisterFiles(u.ring)
   u.fixedFilesRegistered = false
   u.fixedFiles.setLen(0)
+  u.fixedFileSlotsFree.setLen(0)
 
 proc fixedFileCount*(u: UringFileIO): int =
   ## Return the number of registered fixed files.
@@ -940,4 +943,118 @@ proc uringFsyncFixedFile*(u: UringFileIO, fileIndex: cint): Future[int32] =
   sqe.fd = fileIndex
 
   var comp = Completion(future: fut, kind: ckFsync)
+  return queueSqe(u, comp)
+
+# Fixed file slots (for direct descriptors)
+
+proc registerFixedFileSlots*(u: UringFileIO, count: int) {.raises: [IOError].} =
+  ## Register `count` empty fixed file slots (fd=-1) for use with direct descriptors.
+  ## Mutually exclusive with `registerFixedFiles` (io_uring supports one file table).
+  if u.closed:
+    raise newException(IOError, "UringFileIO closed")
+  if u.fixedFilesRegistered:
+    raise newException(IOError, "fixed files already registered")
+  if count <= 0:
+    raise newException(IOError, "count must be positive")
+
+  u.fixedFiles = newSeq[cint](count)
+  for i in 0 ..< count:
+    u.fixedFiles[i] = -1
+
+  try:
+    registerFiles(u.ring, addr u.fixedFiles[0], cuint(count))
+  except OSError as e:
+    u.fixedFiles.setLen(0)
+    raise newException(IOError, "registerFixedFileSlots failed: " & e.msg)
+
+  u.fixedFilesRegistered = true
+  u.fixedFileSlotsFree = newSeq[int32](count)
+  for i in 0 ..< count:
+    u.fixedFileSlotsFree[i] = int32(i)
+
+proc allocFixedFileSlot*(u: UringFileIO): int32 {.raises: [IOError].} =
+  ## Pop a free fixed file slot index. Raises IOError if none available.
+  if u.fixedFileSlotsFree.len == 0:
+    raise newException(IOError, "no free fixed file slots")
+  result = u.fixedFileSlotsFree.pop()
+
+proc freeFixedFileSlot*(u: UringFileIO, slot: int32) =
+  ## Return a fixed file slot to the free pool.
+  u.fixedFileSlotsFree.add(slot)
+
+proc fixedFileSlotsAvailable*(u: UringFileIO): int =
+  ## Return the number of free fixed file slots.
+  u.fixedFileSlotsFree.len
+
+# Direct descriptor operations
+
+proc uringOpenDirect*(
+    u: UringFileIO, path: string, flags: cint, mode: uint32, fileSlot: int32
+): Future[int32] =
+  ## Submit OPENAT operation that installs the fd directly into a fixed file slot.
+  ## `fileSlot` is the 0-indexed slot from `allocFixedFileSlot`.
+  ## CQE result: 0 on success (not an fd), negative errno on failure.
+  let fut = newFuture[int32]("uringOpenDirect")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
+  let sqe = getSqe(u.ring)
+  if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
+    fut.fail(newException(IOError, "io_uring SQ full"))
+    return fut
+
+  var pathRef: ref string
+  new(pathRef)
+  pathRef[] = path
+
+  sqe.opcode = IORING_OP_OPENAT
+  sqe.fd = AT_FDCWD
+  sqe.`addr` = cast[uint64](pathRef[].cstring)
+  sqe.len = uint32(mode)
+  sqe.opFlags = cast[uint32](flags)
+  sqe.spliceFdIn = fileSlot + 1 # 1-indexed: 0 means "normal fd"
+
+  var comp = Completion(future: fut, kind: ckOpen, strRef: pathRef)
+  return queueSqe(u, comp)
+
+proc uringCloseDirect*(u: UringFileIO, fileSlot: int32): Future[int32] =
+  ## Submit CLOSE operation on a direct descriptor slot.
+  ## Closes the fd inside the slot and resets the slot to -1.
+  ## CQE result: 0 on success, negative errno on failure.
+  let fut = newFuture[int32]("uringCloseDirect")
+
+  if u.closed:
+    fut.fail(
+      if u.error != nil:
+        u.error
+      else:
+        newException(IOError, "UringFileIO closed")
+    )
+    return fut
+
+  let sqe = getSqe(u.ring)
+  if sqe == nil:
+    if u.chainActive:
+      u.chainFailed = true
+      u.chainFutures.add(fut)
+      return fut
+    fut.fail(newException(IOError, "io_uring SQ full"))
+    return fut
+
+  sqe.opcode = IORING_OP_CLOSE
+  sqe.fd = 0 # unused for direct close
+  sqe.spliceFdIn = fileSlot + 1 # 1-indexed
+
+  var comp = Completion(future: fut, kind: ckClose)
   return queueSqe(u, comp)

@@ -1326,3 +1326,267 @@ suite "uring_bridge":
     io2.close()
     doAssert io2.fixedFilesRegistered == false
     doAssert io2.fixedFileCount == 0
+
+  # Fixed file slots (direct descriptors)
+
+  test "registerFixedFileSlots: basic register and unregister":
+    io.registerFixedFileSlots(4)
+    doAssert io.fixedFileSlotsAvailable == 4
+    doAssert io.fixedFileCount == 4
+    io.unregisterFixedFiles()
+    doAssert io.fixedFileSlotsAvailable == 0
+    doAssert io.fixedFileCount == 0
+
+  test "registerFixedFileSlots: double register raises IOError":
+    io.registerFixedFileSlots(2)
+    defer:
+      io.unregisterFixedFiles()
+
+    var raised = false
+    try:
+      io.registerFixedFileSlots(2)
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "registerFixedFileSlots: closed instance raises IOError":
+    var io2 = newUringFileIO(32)
+    io2.close()
+
+    var raised = false
+    try:
+      io2.registerFixedFileSlots(2)
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "allocFixedFileSlot/freeFixedFileSlot round trip":
+    io.registerFixedFileSlots(2)
+    defer:
+      io.unregisterFixedFiles()
+
+    doAssert io.fixedFileSlotsAvailable == 2
+    let s1 = io.allocFixedFileSlot()
+    let s2 = io.allocFixedFileSlot()
+    doAssert io.fixedFileSlotsAvailable == 0
+    doAssert s1 != s2
+    io.freeFixedFileSlot(s1)
+    doAssert io.fixedFileSlotsAvailable == 1
+    io.freeFixedFileSlot(s2)
+    doAssert io.fixedFileSlotsAvailable == 2
+
+  test "allocFixedFileSlot: exhaustion raises IOError":
+    io.registerFixedFileSlots(1)
+    defer:
+      io.unregisterFixedFiles()
+
+    discard io.allocFixedFileSlot()
+    var raised = false
+    try:
+      discard io.allocFixedFileSlot()
+    except IOError:
+      raised = true
+    doAssert raised
+
+  test "uringOpenDirect + uringCloseDirect round trip":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(2)
+        defer:
+          io.unregisterFixedFiles()
+
+        let slot = io.allocFixedFileSlot()
+        let openRes = await io.uringOpenDirect("/dev/null", O_RDONLY, 0, slot)
+        doAssert openRes == 0, "openDirect failed: " & $openRes
+
+        let closeRes = await io.uringCloseDirect(slot)
+        doAssert closeRes == 0, "closeDirect failed: " & $closeRes
+
+        io.freeFixedFileSlot(slot)
+
+    waitFor run()
+
+  test "uringOpenDirect: nonexistent file returns negative errno":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(1)
+        defer:
+          io.unregisterFixedFiles()
+
+        let slot = io.allocFixedFileSlot()
+        let res = await io.uringOpenDirect(
+          "/tmp/iori_nonexistent_direct_" & $getpid(), O_RDONLY, 0, slot
+        )
+        doAssert res < 0 # -ENOENT
+        io.freeFixedFileSlot(slot)
+
+    waitFor run()
+
+  test "uringOpenDirect + uringReadFixedFile: read file content":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_open_direct_read.txt"
+        defer:
+          removeFile(path)
+
+        let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fd >= 0
+        let data = "direct read"
+        doAssert posix.write(fd, data.cstring, data.len) == data.len
+        discard posix.close(fd)
+
+        io.registerFixedFileSlots(1)
+        defer:
+          io.unregisterFixedFiles()
+
+        let slot = io.allocFixedFileSlot()
+        let openRes = await io.uringOpenDirect(path, O_RDONLY, 0, slot)
+        doAssert openRes == 0
+
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](data.len)
+        let readRes = await io.uringReadFixedFile(
+          slot.cint, addr bufRef[][0], uint32(data.len), 0'u64, bufRef
+        )
+        doAssert readRes == int32(data.len), "read failed: " & $readRes
+
+        var readBack = newString(data.len)
+        copyMem(addr readBack[0], addr bufRef[][0], data.len)
+        doAssert readBack == data
+
+        let closeRes = await io.uringCloseDirect(slot)
+        doAssert closeRes == 0
+        io.freeFixedFileSlot(slot)
+
+    waitFor run()
+
+  test "chain: openDirect → readFixedFile → closeDirect (3-op)":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_chain_3op_direct.txt"
+        defer:
+          removeFile(path)
+
+        let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+        doAssert fd >= 0
+        let data = "chain3"
+        doAssert posix.write(fd, data.cstring, data.len) == data.len
+        discard posix.close(fd)
+
+        io.registerFixedFileSlots(1)
+        defer:
+          io.unregisterFixedFiles()
+
+        let slot = io.allocFixedFileSlot()
+
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](data.len)
+
+        io.beginChain()
+        let openFut = io.uringOpenDirect(path, O_RDONLY, 0, slot)
+        let readFut = io.uringReadFixedFile(
+          slot.cint, addr bufRef[][0], uint32(data.len), 0'u64, bufRef
+        )
+        let closeFut = io.uringCloseDirect(slot)
+        let futs = io.endChain()
+
+        doAssert futs.len == 3
+
+        let openRes = await openFut
+        let readRes = await readFut
+        let closeRes = await closeFut
+
+        doAssert openRes == 0, "open failed: " & $openRes
+        doAssert readRes == int32(data.len), "read failed: " & $readRes
+        doAssert closeRes == 0, "close failed: " & $closeRes
+
+        var readBack = newString(data.len)
+        copyMem(addr readBack[0], addr bufRef[][0], data.len)
+        doAssert readBack == data
+
+        io.freeFixedFileSlot(slot)
+
+    waitFor run()
+
+  test "chain: openDirect → writeFixedFile → fsyncFixedFile → closeDirect (4-op)":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let path = getTempDir() / "iori_test_chain_4op_direct.bin"
+        defer:
+          removeFile(path)
+
+        io.registerFixedFileSlots(1)
+        defer:
+          io.unregisterFixedFiles()
+
+        let slot = io.allocFixedFileSlot()
+
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 0xCA, 0xFE, 0xBA, 0xBE]
+
+        io.beginChain()
+        let openFut =
+          io.uringOpenDirect(path, O_WRONLY or O_CREAT or O_TRUNC, 0o644, slot)
+        let writeFut = io.uringWriteFixedFile(
+          slot.cint, addr bufRef[][0], uint32(bufRef[].len), 0'u64, bufRef
+        )
+        let fsyncFut = io.uringFsyncFixedFile(slot.cint)
+        let closeFut = io.uringCloseDirect(slot)
+        let futs = io.endChain()
+
+        doAssert futs.len == 4
+
+        let openRes = await openFut
+        let writeRes = await writeFut
+        let fsyncRes = await fsyncFut
+        let closeRes = await closeFut
+
+        doAssert openRes == 0, "open failed: " & $openRes
+        doAssert writeRes == 4, "write failed: " & $writeRes
+        doAssert fsyncRes == 0, "fsync failed: " & $fsyncRes
+        doAssert closeRes == 0, "close failed: " & $closeRes
+
+        # Verify file content with posix
+        let rfd = posix.open(path.cstring, O_RDONLY)
+        doAssert rfd >= 0
+        var readBuf: array[4, byte]
+        doAssert posix.read(rfd, addr readBuf[0], 4) == 4
+        discard posix.close(rfd)
+        doAssert readBuf == [byte 0xCA, 0xFE, 0xBA, 0xBE]
+
+        io.freeFixedFileSlot(slot)
+
+    waitFor run()
+
+  test "chain failure propagation: bad path → openDirect fails → subsequent -ECANCELED":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(1)
+        defer:
+          io.unregisterFixedFiles()
+
+        let slot = io.allocFixedFileSlot()
+
+        var bufRef = new(seq[byte])
+        bufRef[] = newSeq[byte](64)
+
+        io.beginChain()
+        let openFut = io.uringOpenDirect(
+          "/tmp/iori_nonexistent_chain_" & $getpid(), O_RDONLY, 0, slot
+        )
+        let readFut =
+          io.uringReadFixedFile(slot.cint, addr bufRef[][0], 64, 0'u64, bufRef)
+        let closeFut = io.uringCloseDirect(slot)
+        discard io.endChain()
+
+        let openRes = await openFut
+        let readRes = await readFut
+        let closeRes = await closeFut
+
+        doAssert openRes < 0, "open should fail: " & $openRes
+        doAssert readRes == -125, "read should be -ECANCELED: " & $readRes
+        doAssert closeRes == -125, "close should be -ECANCELED: " & $closeRes
+
+        io.freeFixedFileSlot(slot)
+
+    waitFor run()
