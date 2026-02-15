@@ -194,6 +194,25 @@ suite "uring_raw":
     check cqe2 != nil
     advanceCq(ring)
 
+  test "registerBuffers and unregisterBuffers":
+    var ring = setupRing(32)
+    defer:
+      closeRing(ring)
+
+    # Register 2 fixed buffers
+    var buf1 = newSeq[byte](4096)
+    var buf2 = newSeq[byte](8192)
+    var iovecs: array[2, IOVec]
+    iovecs[0].iov_base = addr buf1[0]
+    iovecs[0].iov_len = csize_t(buf1.len)
+    iovecs[1].iov_base = addr buf2[0]
+    iovecs[1].iov_len = csize_t(buf2.len)
+
+    registerBuffers(ring, addr iovecs[0], 2)
+
+    # Unregister
+    unregisterBuffers(ring)
+
   test "all public sync functions callable from async":
     ## Compile-time regression: ensures the compiler's raises inference
     ## allows all uring_raw sync functions to be called from async procs.

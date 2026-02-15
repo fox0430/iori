@@ -507,3 +507,15 @@ proc registerEventfd*(ring: var IoUring, efd: cint) {.raises: [OSError].} =
 proc unregisterEventfd*(ring: var IoUring) =
   ## Unregister eventfd from the io_uring ring.
   discard ioUringRegister(ring.ringFd, IORING_UNREGISTER_EVENTFD, nil, 0)
+
+proc registerBuffers*(
+    ring: var IoUring, iovecs: ptr IOVec, count: cuint
+) {.raises: [OSError].} =
+  ## Register fixed buffers with the io_uring ring. Raises OSError on failure.
+  let res = ioUringRegister(ring.ringFd, IORING_REGISTER_BUFFERS, iovecs, count)
+  if res < 0:
+    raiseOSError(osLastError(), "io_uring_register buffers failed")
+
+proc unregisterBuffers*(ring: var IoUring) =
+  ## Unregister fixed buffers from the io_uring ring.
+  discard ioUringRegister(ring.ringFd, IORING_UNREGISTER_BUFFERS, nil, 0)
