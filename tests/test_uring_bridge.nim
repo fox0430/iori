@@ -588,3 +588,45 @@ suite "uring_bridge":
         io2.close()
 
     waitFor run()
+
+  test "local cancel prevents stale SQE submission":
+    ## After local cancel of an unsubmitted operation, the SQE must not be
+    ## submitted to the kernel on the next flush. Uses a pipe to detect
+    ## whether the cancelled write was actually executed by the kernel.
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var fds: array[2, cint]
+        doAssert pipe(fds) == 0
+        let readFd = fds[0]
+        let writeFd = fds[1]
+        defer:
+          discard posix.close(readFd)
+          discard posix.close(writeFd)
+
+        # Make read end non-blocking for the final check
+        let fl = fcntl(readFd, F_GETFL)
+        doAssert fcntl(readFd, F_SETFL, fl or O_NONBLOCK) == 0
+
+        # Queue a write to the pipe — SQE prepared but not yet submitted
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 0xDE, 0xAD, 0xBE, 0xEF]
+        let writeFut = io.uringWrite(writeFd, addr bufRef[][0], 4, 0'u64, bufRef)
+
+        # Cancel locally before flush fires
+        let cancelRes = await io.uringCancel(writeFut)
+        doAssert cancelRes == 0
+        doAssert (await writeFut) == -125 # ECANCELED
+
+        # Trigger flush by queuing + awaiting another operation.
+        # submit() sends ALL pending SQEs including the stale cancelled one.
+        let fd = await io.uringOpen("/dev/null", O_RDONLY, 0)
+        doAssert fd >= 0
+        discard await io.uringClose(fd.cint)
+
+        # If the stale write SQE was submitted, data is now in the pipe.
+        var checkBuf: array[4, byte]
+        let n = posix.read(readFd, addr checkBuf[0], 4)
+        doAssert n <= 0,
+          "stale SQE was submitted to kernel: pipe contains " & $n & " bytes"
+
+    waitFor run()
