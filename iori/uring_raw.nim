@@ -75,6 +75,9 @@ const
   IORING_UNREGISTER_EVENTFD* = 5'u32
   IORING_REGISTER_FILES_UPDATE* = 6'u32
 
+  # Direct descriptor
+  IORING_FILE_INDEX_ALLOC* = 0xFFFFFFFF'u32
+
   # Feature flags
   IORING_FEAT_SINGLE_MMAP* = 1'u32 shl 0
 

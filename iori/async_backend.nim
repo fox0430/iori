@@ -42,7 +42,7 @@ when hasChronos:
           cb(),
         nil,
       )
-      .tryGet()
+        .tryGet()
     except CatchableError as e:
       discard unregister2(afd)
       raise e

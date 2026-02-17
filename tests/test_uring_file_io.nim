@@ -490,3 +490,297 @@ suite "uring_file_io":
         doAssert caughtIO
 
     waitFor run()
+
+  # Direct descriptor variants
+
+  test "writeFileDirect and readFileDirect roundtrip":
+    let path = getTempDir() / "iori_test_direct_roundtrip.bin"
+    defer:
+      removeFile(path)
+
+    let data = @[byte 1, 2, 3, 4, 5, 0xDE, 0xAD, 0xBE, 0xEF]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        await io.writeFileDirect(path, data)
+        let readResult = await io.readFileDirect(path)
+        doAssert readResult == data
+
+    waitFor run()
+
+  test "writeFileStringDirect and readFileStringDirect roundtrip":
+    let path = getTempDir() / "iori_test_direct_roundtrip.txt"
+    defer:
+      removeFile(path)
+
+    let content = "Hello, direct descriptors!\nLine 2\n"
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        await io.writeFileStringDirect(path, content)
+        let readResult = await io.readFileStringDirect(path)
+        doAssert readResult == content
+
+    waitFor run()
+
+  test "readFileDirect on nonexistent file raises IOError":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        var raised = false
+        try:
+          discard await io.readFileDirect("/tmp/iori_nonexistent_direct_" & $getpid())
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "writeFileDirect and readFileDirect large data":
+    let path = getTempDir() / "iori_test_direct_large.bin"
+    defer:
+      removeFile(path)
+
+    var data = newSeq[byte](65536)
+    for i in 0 ..< data.len:
+      data[i] = byte(i mod 256)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        await io.writeFileDirect(path, data)
+        let readResult = await io.readFileDirect(path)
+        doAssert readResult.len == data.len
+        doAssert readResult == data
+
+    waitFor run()
+
+  test "writeFileDirect and readFileDirect empty data":
+    let path = getTempDir() / "iori_test_direct_empty.bin"
+    defer:
+      removeFile(path)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        await io.writeFileDirect(path, @[])
+        let readResult = await io.readFileDirect(path)
+        doAssert readResult.len == 0
+
+    waitFor run()
+
+  test "writeFileDirect overwrites existing file":
+    let path = getTempDir() / "iori_test_direct_overwrite.bin"
+    defer:
+      removeFile(path)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        await io.writeFileDirect(path, @[byte 1, 2, 3, 4, 5])
+        await io.writeFileDirect(path, @[byte 10, 20])
+        let readBack = await io.readFileDirect(path)
+        doAssert readBack == @[byte 10, 20]
+
+    waitFor run()
+
+  test "writeFileDirect with fsync=false":
+    let path = getTempDir() / "iori_test_direct_no_fsync.bin"
+    defer:
+      removeFile(path)
+
+    let data = @[byte 1, 2, 3, 4, 5]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        await io.writeFileDirect(path, data, fsync = false)
+        let readResult = await io.readFileDirect(path)
+        doAssert readResult == data
+
+    waitFor run()
+
+  test "concurrent direct read and write operations":
+    let pathA = getTempDir() / "iori_test_direct_concurrent_a.bin"
+    let pathB = getTempDir() / "iori_test_direct_concurrent_b.bin"
+    defer:
+      removeFile(pathA)
+      removeFile(pathB)
+
+    let dataA = @[byte 0xAA, 0xBB, 0xCC]
+    let dataB = @[byte 0x11, 0x22, 0x33, 0x44]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        let futA = io.writeFileDirect(pathA, dataA)
+        let futB = io.writeFileDirect(pathB, dataB)
+        await futA
+        await futB
+
+        let futReadA = io.readFileDirect(pathA)
+        let futReadB = io.readFileDirect(pathB)
+        let resultA = await futReadA
+        let resultB = await futReadB
+
+        doAssert resultA == dataA
+        doAssert resultB == dataB
+
+    waitFor run()
+
+  test "writeFileDirect to read-only path raises IOError":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        var raised = false
+        try:
+          await io.writeFileDirect("/proc/nonexistent_iori_test", @[byte 1])
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "readFileDirect with timeout succeeds for normal file":
+    let path = getTempDir() / "iori_test_direct_timeout_read.bin"
+    defer:
+      removeFile(path)
+
+    let data = @[byte 1, 2, 3, 4, 5]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        await io.writeFileDirect(path, data)
+        let r = await io.readFileDirect(path, timeoutMs = 5000)
+        doAssert r == data
+
+    waitFor run()
+
+  test "writeFileDirect with timeout succeeds for normal file":
+    let path = getTempDir() / "iori_test_direct_timeout_write.bin"
+    defer:
+      removeFile(path)
+
+    let data = @[byte 10, 20, 30]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        await io.writeFileDirect(path, data, timeoutMs = 5000)
+        let r = await io.readFileDirect(path)
+        doAssert r == data
+
+    waitFor run()
+
+  test "writeFileDirect without registered slots raises IOError":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var raised = false
+        try:
+          await io.writeFileDirect("/tmp/iori_test_direct_no_slots.bin", @[byte 1])
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
+
+  test "readFileDirect slot not leaked on error":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(1)
+        defer:
+          io.unregisterFixedFiles()
+
+        doAssert io.fixedFileSlotsAvailable == 1
+
+        var raised = false
+        try:
+          discard await io.readFileDirect("/tmp/iori_nonexistent_leak_" & $getpid())
+        except IOError:
+          raised = true
+        doAssert raised
+
+        # Slot must have been returned to the pool
+        doAssert io.fixedFileSlotsAvailable == 1
+
+    waitFor run()
+
+  test "writeFileDirect slot not leaked on error":
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(1)
+        defer:
+          io.unregisterFixedFiles()
+
+        doAssert io.fixedFileSlotsAvailable == 1
+
+        var raised = false
+        try:
+          await io.writeFileDirect("/proc/nonexistent_iori_leak_test", @[byte 1])
+        except IOError:
+          raised = true
+        doAssert raised
+
+        # Slot must have been returned to the pool
+        doAssert io.fixedFileSlotsAvailable == 1
+
+    waitFor run()
+
+  test "readFileDirect without registered slots raises IOError":
+    let path = getTempDir() / "iori_test_direct_no_slots.txt"
+    defer:
+      removeFile(path)
+
+    # Create a file with content so statx returns size > 0
+    let fd = posix.open(path.cstring, O_WRONLY or O_CREAT or O_TRUNC, 0o644)
+    doAssert fd >= 0
+    let data = "test"
+    doAssert posix.write(fd, data.cstring, data.len) == data.len
+    discard posix.close(fd)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        var raised = false
+        try:
+          discard await io.readFileDirect(path)
+        except IOError:
+          raised = true
+        doAssert raised
+
+    waitFor run()
