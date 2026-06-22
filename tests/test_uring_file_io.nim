@@ -185,6 +185,34 @@ suite "uring_file_io":
 
     waitFor run()
 
+  test "writeFile with dataOnly uses fdatasync":
+    let path = getTempDir() / "iori_test_datasync.bin"
+    defer:
+      removeFile(path)
+
+    let data = @[byte 1, 2, 3, 4, 5]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        await io.writeFile(path, data, dataOnly = true)
+        let readResult = await io.readFile(path)
+        doAssert readResult == data
+
+    waitFor run()
+
+  test "writeFileString with dataOnly uses fdatasync":
+    let path = getTempDir() / "iori_test_datasync.txt"
+    defer:
+      removeFile(path)
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        await io.writeFileString(path, "datasync test", dataOnly = true)
+        let readResult = await io.readFileString(path)
+        doAssert readResult == "datasync test"
+
+    waitFor run()
+
   test "full lifecycle inside async proc":
     ## Regression: newUringFileIO() must be callable from async procs.
     ## Without proper {.raises.} annotations, Chronos rejects sync calls
@@ -618,6 +646,25 @@ suite "uring_file_io":
           io.unregisterFixedFiles()
 
         await io.writeFileDirect(path, data, fsync = false)
+        let readResult = await io.readFileDirect(path)
+        doAssert readResult == data
+
+    waitFor run()
+
+  test "writeFileDirect with dataOnly uses fdatasync":
+    let path = getTempDir() / "iori_test_direct_datasync.bin"
+    defer:
+      removeFile(path)
+
+    let data = @[byte 1, 2, 3, 4, 5]
+
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        io.registerFixedFileSlots(4)
+        defer:
+          io.unregisterFixedFiles()
+
+        await io.writeFileDirect(path, data, dataOnly = true)
         let readResult = await io.readFileDirect(path)
         doAssert readResult == data
 
