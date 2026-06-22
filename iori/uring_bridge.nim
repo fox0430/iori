@@ -345,8 +345,11 @@ proc uringWrite*(
   var comp = Completion(future: fut, kind: ckWrite, bufRef: bufRef)
   return queueSqe(u, comp)
 
-proc uringFsync*(u: UringFileIO, fd: cint): Future[int32] =
+proc uringFsync*(u: UringFileIO, fd: cint, dataOnly: bool = false): Future[int32] =
   ## Submit FSYNC operation. Returns Future with 0 on success or negative errno.
+  ## If dataOnly is true, only file data is flushed (fdatasync semantics) by
+  ## setting the IORING_FSYNC_DATASYNC flag, leaving non-essential metadata
+  ## (e.g. mtime) unsynced.
   let fut = newFuture[int32]("uringFsync")
 
   if u.closed:
@@ -369,6 +372,8 @@ proc uringFsync*(u: UringFileIO, fd: cint): Future[int32] =
 
   sqe.opcode = IORING_OP_FSYNC
   sqe.fd = fd
+  if dataOnly:
+    sqe.opFlags = IORING_FSYNC_DATASYNC
 
   var comp = Completion(future: fut, kind: ckFsync)
   return queueSqe(u, comp)
@@ -915,9 +920,14 @@ proc uringWriteFixedFile*(
   var comp = Completion(future: fut, kind: ckWrite, bufRef: bufRef)
   return queueSqe(u, comp)
 
-proc uringFsyncFixedFile*(u: UringFileIO, fileIndex: cint): Future[int32] =
+proc uringFsyncFixedFile*(
+    u: UringFileIO, fileIndex: cint, dataOnly: bool = false
+): Future[int32] =
   ## Submit FSYNC operation using a fixed file index.
   ## `fileIndex` is the index into the registered file table (not a real fd).
+  ## If dataOnly is true, only file data is flushed (fdatasync semantics) by
+  ## setting the IORING_FSYNC_DATASYNC flag, leaving non-essential metadata
+  ## (e.g. mtime) unsynced.
   let fut = newFuture[int32]("uringFsyncFixedFile")
 
   if u.closed:
@@ -941,6 +951,8 @@ proc uringFsyncFixedFile*(u: UringFileIO, fileIndex: cint): Future[int32] =
   sqe.opcode = IORING_OP_FSYNC
   sqe.flags = IOSQE_FIXED_FILE
   sqe.fd = fileIndex
+  if dataOnly:
+    sqe.opFlags = IORING_FSYNC_DATASYNC
 
   var comp = Completion(future: fut, kind: ckFsync)
   return queueSqe(u, comp)

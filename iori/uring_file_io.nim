@@ -177,9 +177,13 @@ proc writeFile*(
     data: seq[byte],
     timeoutMs: int = 0,
     fsync: bool = true,
+    dataOnly: bool = false,
 ): Future[void] {.async.} =
   ## Write data to file. Creates/truncates file. Raises IOError on failure.
   ## If fsync is false, skip the fsync call after writing.
+  ## If dataOnly is true, the post-write fsync uses fdatasync semantics
+  ## (only file data is flushed, not non-essential metadata). Ignored if
+  ## fsync is false.
   ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
   let deadline =
     if timeoutMs > 0:
@@ -206,7 +210,7 @@ proc writeFile*(
       let writeFut =
         uringWrite(u, fd.cint, addr dataRef[][0], uint32(data.len), 0'u64, dataRef)
       if fsync:
-        fsyncFut = uringFsync(u, fd.cint)
+        fsyncFut = uringFsync(u, fd.cint, dataOnly)
       let closeFut = uringClose(u, fd.cint)
       discard u.endChain()
 
@@ -253,7 +257,7 @@ proc writeFile*(
       # Chain fsync → close or just close
       if fsync:
         u.beginChain()
-        let fsyncFut = uringFsync(u, fd.cint)
+        let fsyncFut = uringFsync(u, fd.cint, dataOnly)
         let closeFut = uringClose(u, fd.cint)
         discard u.endChain()
 
@@ -271,7 +275,7 @@ proc writeFile*(
       # Empty data
       if fsync:
         u.beginChain()
-        let fsyncFut = uringFsync(u, fd.cint)
+        let fsyncFut = uringFsync(u, fd.cint, dataOnly)
         let closeFut = uringClose(u, fd.cint)
         discard u.endChain()
 
@@ -301,15 +305,21 @@ proc readFileString*(
   return s
 
 proc writeFileString*(
-    u: UringFileIO, path: string, data: string, timeoutMs: int = 0, fsync: bool = true
+    u: UringFileIO,
+    path: string,
+    data: string,
+    timeoutMs: int = 0,
+    fsync: bool = true,
+    dataOnly: bool = false,
 ): Future[void] {.async.} =
   ## Write string to file. Creates/truncates file. Raises IOError on failure.
   ## If fsync is false, skip the fsync call after writing.
+  ## If dataOnly is true, the post-write fsync uses fdatasync semantics.
   ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
   var bytes = newSeq[byte](data.len)
   if data.len > 0:
     copyMem(addr bytes[0], unsafeAddr data[0], data.len)
-  await writeFile(u, path, bytes, timeoutMs, fsync)
+  await writeFile(u, path, bytes, timeoutMs, fsync, dataOnly)
 
 # Direct descriptor variants
 
@@ -421,10 +431,14 @@ proc writeFileDirect*(
     data: seq[byte],
     timeoutMs: int = 0,
     fsync: bool = true,
+    dataOnly: bool = false,
 ): Future[void] {.async.} =
   ## Write data to file using direct descriptors. Requires `registerFixedFileSlots`.
   ## Chains openDirect → writeFixedFile → fsyncFixedFile → closeDirect in a single
   ## submission (1 syscall for data ≤ 4GB).
+  ## If dataOnly is true, the post-write fsync uses fdatasync semantics
+  ## (only file data is flushed, not non-essential metadata). Ignored if
+  ## fsync is false.
   ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
   let deadline =
     if timeoutMs > 0:
@@ -453,7 +467,7 @@ proc writeFileDirect*(
         )
       var fsyncFut: Future[int32]
       if fsync:
-        fsyncFut = uringFsyncFixedFile(u, slot.cint)
+        fsyncFut = uringFsyncFixedFile(u, slot.cint, dataOnly)
       let closeFut = u.uringCloseDirect(slot)
       discard u.endChain()
 
@@ -510,7 +524,7 @@ proc writeFileDirect*(
 
       if fsync:
         u.beginChain()
-        let fsyncFut = uringFsyncFixedFile(u, slot.cint)
+        let fsyncFut = uringFsyncFixedFile(u, slot.cint, dataOnly)
         let closeFut = u.uringCloseDirect(slot)
         discard u.endChain()
 
@@ -544,12 +558,18 @@ proc readFileStringDirect*(
   return s
 
 proc writeFileStringDirect*(
-    u: UringFileIO, path: string, data: string, timeoutMs: int = 0, fsync: bool = true
+    u: UringFileIO,
+    path: string,
+    data: string,
+    timeoutMs: int = 0,
+    fsync: bool = true,
+    dataOnly: bool = false,
 ): Future[void] {.async.} =
   ## Write string to file using direct descriptors.
   ## Requires `registerFixedFileSlots`.
+  ## If dataOnly is true, the post-write fsync uses fdatasync semantics.
   ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
   var bytes = newSeq[byte](data.len)
   if data.len > 0:
     copyMem(addr bytes[0], unsafeAddr data[0], data.len)
-  await writeFileDirect(u, path, bytes, timeoutMs, fsync)
+  await writeFileDirect(u, path, bytes, timeoutMs, fsync, dataOnly)
