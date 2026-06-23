@@ -6,16 +6,14 @@
 when not defined(linux):
   {.fatal: "uring_bridge requires Linux".}
 
-import std/[tables, posix, oserrors]
+import std/[tables, posix, oserrors, sequtils]
 
-import ./async_backend
-import ./uring_raw
+import async_backend, uring_raw
+
+when hasChronos:
+  import std/sets
 
 export async_backend
-
-const
-  EFD_NONBLOCK = 0x00000800.cint
-  EFD_CLOEXEC = 0x00080000.cint
 
 proc eventfd(initval: cuint, flags: cint): cint {.importc, header: "<sys/eventfd.h>".}
 
@@ -56,11 +54,21 @@ type
     chainIds: seq[uint64] # SQE IDs queued during current chain (for rollback)
     chainFutures: seq[Future[int32]] # Futures queued during current chain
     chainFailed: bool # Whether a getSqe returned nil during chain
+    deferredCancels: seq[Future[int32]]
+      # Submitted ops whose external-cancel ASYNC_CANCEL could not be issued yet
+      # (a chain was open, or the SQ was full); retried by drainDeferredCancels
+      # after endChain / flush.
+    cancelCb: BridgeCancelCallback
+      # Shared chronos cancel callback (one per instance, not per op)
     fixedBufs: seq[seq[byte]] # Registered fixed buffers (GC root)
     fixedBufsRegistered: bool
     fixedFiles: seq[cint] # Registered fixed file descriptors (copy)
     fixedFilesRegistered: bool
     fixedFileSlotsFree: seq[int32] # Direct open: free slot stack
+
+const
+  EFD_NONBLOCK = 0x00000800.cint
+  EFD_CLOEXEC = 0x00080000.cint
 
 proc allocId(u: UringFileIO): uint64 =
   ## ID allocation
@@ -75,6 +83,38 @@ proc stopPollLoop(u: UringFileIO) {.raises: [].} =
       u.error = e
   u.selfRef = nil
 
+template castGcsafeNoRaise(body: untyped) =
+  ## Assert to the compiler that `body` is gcsafe and non-raising. The bridge runs
+  ## on a single-threaded event loop, so the captured `UringFileIO` is never touched
+  ## concurrently (gcsafe), and the io_uring SQE/queue calls inside do not actually
+  ## raise — but the compiler cannot prove either through the chronos cancel-callback
+  ## boundary. Centralizes the `{.cast(gcsafe).}: {.cast(raises: []).}:` pair used by
+  ## the external-cancellation paths (tryKernelCancel / queueAsyncCancel /
+  ## handleExternalCancel).
+  {.cast(gcsafe).}:
+    {.cast(raises: []).}:
+      body
+
+proc settleIfPending(fut: Future[int32], val: int32) {.raises: [].} =
+  ## Complete `fut` with `val` unless it is already finished. A bridge future can
+  ## be moved to Cancelled by external chronos cancellation while its kernel op is
+  ## still in flight; re-completing such a finished future would raise a
+  ## FutureDefect (chronos no-ops complete/fail only for the *cancelled* state,
+  ## and asyncdispatch is not cancel-safe either). The cast suppresses the
+  ## theoretical ValueError from Future.complete.
+  {.cast(raises: []).}:
+    if not fut.finished:
+      fut.complete(val)
+
+proc failIfPending(fut: Future[int32], err: ref CatchableError) {.raises: [].} =
+  ## Fail `fut` with `err` unless it is already finished — the error-path mirror of
+  ## settleIfPending. An externally-cancelled future is already Cancelled and must
+  ## not be re-failed (chronos no-ops fail() only for the cancelled state; any other
+  ## finished state raises FutureDefect).
+  {.cast(raises: []).}:
+    if not fut.finished:
+      fut.fail(err)
+
 proc processCqes(u: UringFileIO) {.raises: [].} =
   ## CQE processing
   while not u.closed:
@@ -88,10 +128,12 @@ proc processCqes(u: UringFileIO) {.raises: [].} =
     var comp: Completion
     if u.pending.pop(id, comp):
       u.futureToId.del(cast[pointer](comp.future))
-      # Each ID is unique and popped from pending, so double-completion is impossible.
-      # cast(raises) suppresses the theoretical ValueError from Future.complete.
-      {.cast(raises: []).}:
-        comp.future.complete(res)
+      # The future may already be finished when its CQE arrives if a consumer
+      # cancelled it externally (see handleExternalCancel): chronos has moved it
+      # to Cancelled while the Completion stayed rooted in `pending` until the
+      # kernel was done. We still pop here to release the GC roots, but
+      # settleIfPending must not re-finish it.
+      settleIfPending(comp.future, res)
 
 proc close*(u: UringFileIO) {.raises: [].} =
   ## Close the UringFileIO instance. Fails all pending futures and releases resources.
@@ -108,6 +150,8 @@ proc close*(u: UringFileIO) {.raises: [].} =
   stopPollLoop(u)
   u.flushScheduled = false
   u.unsubmitted.setLen(0)
+  u.deferredCancels.setLen(0)
+  u.cancelCb = nil # break the u -> cancelCb -> u reference cycle
 
   let err =
     if u.error != nil:
@@ -123,14 +167,14 @@ proc close*(u: UringFileIO) {.raises: [].} =
   u.pending.clear()
   u.futureToId.clear()
   for comp in pending:
-    {.cast(raises: []).}:
-      comp.future.fail(err)
+    # A pending future may already be finished if a consumer cancelled it
+    # externally (chronos marks it Cancelled while its Completion stayed rooted
+    # here until the kernel was done): failIfPending skips those.
+    failIfPending(comp.future, err)
 
   # Fail chain futures not in pending (e.g. from chainFailed path)
   for fut in u.chainFutures:
-    if not fut.finished:
-      {.cast(raises: []).}:
-        fut.fail(err)
+    failIfPending(fut, err)
   u.chainIds.setLen(0)
   u.chainFutures.setLen(0)
 
@@ -178,34 +222,107 @@ proc startPollLoop(u: UringFileIO) {.raises: [OSError].} =
     u.selfRef = nil
     raise (ref OSError)(msg: "eventfd registration failed: " & e.msg)
 
+# Single forward declaration: the submit/cancel machinery forms a genuine cycle —
+#   flush -> drainDeferredCancels -> tryKernelCancel -> queueAsyncCancel ->
+#   queueSqe -> flush (queueSqe re-arms flush via scheduleSoon).
+# Every other proc below is defined before its callers; flush is defined early
+# (it is the public entry point queueSqe schedules), so the one edge that must
+# point forward is flush -> drainDeferredCancels.
+proc drainDeferredCancels(u: UringFileIO) {.gcsafe, raises: [].}
+
 proc flush*(u: UringFileIO) {.raises: [].} =
   ## Flush all queued SQEs to the kernel in a single io_uring_enter syscall.
   if u.chainActive:
     return # Keep flushScheduled; endChain will allow flush
   u.flushScheduled = false
-  if u.closed or u.unsubmitted.len == 0:
+  if u.closed:
     return
 
+  # submit() makes no syscall when nothing is pending, but still publishes SQEs
+  # that a cancel neutralized into NOPs (those are no longer tracked in
+  # `unsubmitted`): flushing them frees their SQ slots so the deferred-cancel
+  # retry below is not wedged behind stale NOPs.
   let ret = submit(u.ring)
   if ret < 0:
-    # Submit failed: fail only unsubmitted futures (already-submitted ones complete via CQE)
+    # Submit failed: io_uring_enter rolled the SQ ring back (uring_raw submit()),
+    # discarding every SQE queued this batch — including any ASYNC_CANCEL. Fail the
+    # unsubmitted user futures (already-submitted ones still complete via CQE).
+    let err =
+      newException(IOError, "io_uring submit failed: " & osErrorMsg(OSErrorCode(-ret)))
     for id in u.unsubmitted:
       var comp: Completion
       if u.pending.pop(id, comp):
         u.futureToId.del(cast[pointer](comp.future))
-        {.cast(raises: []).}:
-          comp.future.fail(
-            newException(
-              IOError, "io_uring submit failed: " & osErrorMsg(OSErrorCode(-ret))
-            )
-          )
+        failIfPending(comp.future, err)
+    when hasChronos:
+      # A rolled-back ASYNC_CANCEL for an externally-cancelled submitted op is now
+      # lost, and tryKernelCancel already dropped that target from deferredCancels
+      # (it reported the queued-but-unsubmitted cancel as success). Without this it
+      # would never retry, stranding the op's Completion (and its buffer) in
+      # `pending` until close(). Re-defer the cancel of every still-pending op whose
+      # future was already settled externally (a finished future left in `pending`
+      # can only be one chronos cancelled out from under its in-flight kernel op).
+      # Snapshot already-deferred targets into a set so the dedup is O(n+m), not
+      # O(n*m) (one anyIt scan of deferredCancels per pending entry).
+      # containsOrIncl folds the membership check and insert, so a finished pending
+      # future is re-deferred only the first time it is seen.
+      var deferred = initHashSet[pointer]()
+      for fut in u.deferredCancels:
+        deferred.incl(cast[pointer](fut))
+      for comp in u.pending.values:
+        if comp.future.finished and
+            not deferred.containsOrIncl(cast[pointer](comp.future)):
+          u.deferredCancels.add(comp.future)
   u.unsubmitted.setLen(0)
 
-proc queueSqe(u: UringFileIO, comp: Completion): Future[int32] =
+  # Retry kernel cancels deferred because the SQ ring was full — submitting above
+  # freed slots. Run this even when there was nothing to submit: a deferred
+  # cancel must not depend on this particular flush carrying work.
+  u.drainDeferredCancels()
+
+proc removeUnsubmitted(u: UringFileIO, id: uint64): bool {.raises: [].} =
+  ## Remove `id` from the unsubmitted queue if present. Returns true if it was
+  ## found and removed. Shared by dropUnsubmitted and endChain's rollback so the
+  ## linear scan lives in one place.
+  for i, qid in u.unsubmitted:
+    if qid == id:
+      u.unsubmitted.delete(i)
+      return true
+  false
+
+proc dropUnsubmitted(u: UringFileIO, id: uint64): bool {.raises: [].} =
+  ## If `id` is still queued-but-unsubmitted, neutralize it locally without a
+  ## kernel roundtrip: remove it from `unsubmitted`, turn its queued SQE into a
+  ## NOP, and drop its Completion (releasing its GC roots). The stale NOP, if it
+  ## is ever flushed, is ignored by processCqes since its id is no longer in
+  ## `pending`. Returns true if the op was unsubmitted (handled here), false if
+  ## it had already been submitted to the kernel.
+  ##
+  ## The caller decides how to settle the future: `uringCancel` completes it with
+  ## -ECANCELED (its low-level contract); external cancellation leaves it for
+  ## chronos to mark Cancelled.
+  if not u.removeUnsubmitted(id):
+    return false
+  nopifySqe(u.ring, id)
+  var comp: Completion
+  if u.pending.pop(id, comp):
+    u.futureToId.del(cast[pointer](comp.future))
+    # If the dropped op is a member of the chain currently being built, remove
+    # its future from chainFutures so endChain does not hand back an already
+    # settled future. Its id stays in chainIds: the SQE slot is still allocated
+    # (now a NOP), so endChain's rollback count must keep counting it.
+    if u.chainActive:
+      let p = cast[pointer](comp.future)
+      u.chainFutures.keepItIf(cast[pointer](it) != p)
+  true
+
+proc queueSqe(u: UringFileIO, comp: Completion, armCancel = true): Future[int32] =
   ## Queue the most recently prepared SQE for batch submission.
   ## The caller must have already called getSqe and filled the SQE fields
   ## (except userData, which this proc sets).
   ## The SQE will be submitted on the next event loop tick via callSoon.
+  ## Pass `armCancel = false` for the internal ASYNC_CANCEL op: cancelling a
+  ## cancel has no useful meaning and would re-enter the cancel machinery.
   let fut = comp.future
   let id = u.allocId()
 
@@ -219,6 +336,12 @@ proc queueSqe(u: UringFileIO, comp: Completion): Future[int32] =
   u.pending[id] = comp
   u.futureToId[cast[pointer](fut)] = id
   u.unsubmitted.add(id)
+  if armCancel:
+    # Wire external (chronos) cancellation to handleExternalCancel via the shared
+    # per-instance `u.cancelCb` (built once in newUringFileIO), so arming allocates
+    # nothing. No-op on asyncdispatch: `u.cancelCb` is nil and setCancelCallback
+    # discards both args, keeping that backend's hot path allocation-free.
+    setCancelCallback(fut, u.cancelCb)
 
   if not u.flushScheduled:
     u.flushScheduled = true
@@ -228,6 +351,111 @@ proc queueSqe(u: UringFileIO, comp: Completion): Future[int32] =
     )
 
   return fut
+
+proc queueAsyncCancel(
+    u: UringFileIO, targetId: uint64, cancelFut: Future[int32]
+): bool {.gcsafe, raises: [].} =
+  ## Build and queue an io_uring ASYNC_CANCEL SQE for the submitted op `targetId`,
+  ## using `cancelFut` as the cancel op's own result future. Returns false (queuing
+  ## nothing) if the SQ ring was full. Preconditions: not closed, not chainActive,
+  ## target already submitted. Shared by the public `uringCancel` and the internal
+  ## `tryKernelCancel` so the ASYNC_CANCEL SQE is constructed in exactly one place.
+  castGcsafeNoRaise:
+    let sqe = getSqe(u.ring)
+    if sqe == nil:
+      return false
+    sqe.opcode = IORING_OP_ASYNC_CANCEL
+    sqe.`addr` = targetId
+    var comp = Completion(future: cancelFut, kind: ckCancel)
+    discard queueSqe(u, comp, armCancel = false)
+    return true
+
+proc tryKernelCancel(
+    u: UringFileIO, target: Future[int32], tid: uint64
+): bool {.gcsafe, raises: [].} =
+  ## Try to issue an io_uring ASYNC_CANCEL for an externally-cancelled *submitted*
+  ## op right now. `tid` is the target's pending id from futureToId (0 if already
+  ## reaped); callers pass it so the lookup is not repeated. Returns true if it was
+  ## issued (or the op was already reaped by its CQE — nothing to do), false if it
+  ## must be retried later because either:
+  ##   * a linked chain is mid-construction — inserting an ASYNC_CANCEL SQE would
+  ##     split it (IOSQE_IO_LINK links each SQE to the one physically following
+  ##     it, so the next user op would be cancelled — data loss); or
+  ##   * the SQ ring is full — getSqe returned nil, so uringCancel could not queue
+  ##     the ASYNC_CANCEL.
+  ## drainDeferredCancels drives the retry (after endChain and after flush).
+  if tid == 0'u64:
+    return true # already reaped by its CQE — nothing to cancel
+  if u.chainActive:
+    return false # chain still open — defer to avoid grafting into the chain
+  castGcsafeNoRaise:
+    # The cancel op's own future is internal: its CQE result is intentionally
+    # discarded (we follow chronos cancellation, not the -125 contract).
+    let cancelFut = newFuture[int32]("kernelCancel")
+    result = u.queueAsyncCancel(tid, cancelFut)
+    if not result:
+      # SQ full: nothing was queued, so cancelFut would be an unfinished orphan.
+      # Settle it so it does not leak; the target stays in deferredCancels and
+      # the next drain retries.
+      cancelFut.complete(0'i32)
+
+proc drainDeferredCancels(u: UringFileIO) {.gcsafe, raises: [].} =
+  ## Retry kernel cancels that could not be issued when their future was first
+  ## cancelled (a linked chain was open, or the SQ ring was full). Called after
+  ## endChain finalizes a chain and after flush frees SQ slots, so retries are
+  ## driven by the event that unblocks them — no per-tick polling. Entries that
+  ## still cannot be issued are kept for the next drain.
+  if u.deferredCancels.len == 0:
+    return
+  # Keep only targets whose cancel still can't be issued, compacting in place
+  # (keepItIf does not reallocate). Callers (flush, endChain) never invoke this on
+  # a closed instance and close() already empties deferredCancels, so no per-entry
+  # closed check is needed. An entry may have been reaped since it was deferred, so
+  # re-resolve its id here (0 = reaped → tryKernelCancel reports nothing to do).
+  u.deferredCancels.keepItIf(
+    not u.tryKernelCancel(it, u.futureToId.getOrDefault(cast[pointer](it), 0'u64))
+  )
+
+when hasChronos:
+  # Chronos-only: this is the body of the per-instance `cancelCb` wired in
+  # newUringFileIO. asyncdispatch has no external-cancellation callback
+  # (setCancelCallback is a no-op there), so under that backend the proc would be
+  # dead code — Nim flags it XDeclaredButNotUsed. Gating it here keeps it out of
+  # the asyncdispatch build entirely.
+  proc handleExternalCancel(
+      u: UringFileIO, target: Future[int32]
+  ) {.gcsafe, raises: [].} =
+    ## Make an externally-cancelled bridge future stop its kernel op and settle in
+    ## the *Cancelled* state — consistently for submitted and unsubmitted ops.
+    ##
+    ## Runs when a consumer cancels the future through the async backend (chronos
+    ## `cancel`/`cancelAndWait`/`cancelSoon`); wired as the shared cancel callback in
+    ## queueSqe via setCancelCallback. An unsubmitted
+    ## op — whose buffer the kernel never saw — is neutralized into a NOP and its
+    ## Completion dropped immediately. A submitted op is cancelled with io_uring
+    ## ASYNC_CANCEL and its Completion is left in `pending` (keeping the buffer
+    ## GC-rooted) until the -ECANCELED CQE reaps it; if the cancel cannot be issued
+    ## right now (a chain is open, or the SQ is full) it is queued in
+    ## `deferredCancels` and retried by drainDeferredCancels. In no case do we
+    ## complete the future here: chronos moves it to Cancelled right after this
+    ## callback.
+    ##
+    ## Deliberately different from the public `uringCancel`, which *completes* the
+    ## target with -ECANCELED; here we follow chronos cancellation semantics.
+    if u.closed:
+      return
+    castGcsafeNoRaise:
+      # Single futureToId probe: ids start at 1, so 0 means "not tracked" —
+      # already reaped by its CQE, nothing to cancel.
+      let tid = u.futureToId.getOrDefault(cast[pointer](target), 0'u64)
+      if tid == 0'u64:
+        return
+      if u.dropUnsubmitted(tid):
+        discard # unsubmitted: handled locally; chronos marks it Cancelled
+      elif not u.tryKernelCancel(target, tid):
+        # `tid` is still valid: dropUnsubmitted returned false without touching
+        # futureToId (the op was already submitted, not in `unsubmitted`).
+        u.deferredCancels.add(target) # submitted but blocked — retry later
 
 proc uringOpen*(
     u: UringFileIO, path: string, flags: cint, mode: uint32 = 0o644
@@ -529,7 +757,10 @@ proc uringRenameat*(
 
 proc uringCancel*(u: UringFileIO, target: Future[int32]): Future[int32] =
   ## Submit ASYNC_CANCEL for a pending operation. Returns Future with 0 on success
-  ## or negative errno. The cancelled target Future will complete with -ECANCELED (-125).
+  ## or negative errno. The cancelled target Future will complete with -ECANCELED
+  ## (-125) — unless it was already settled by external (chronos) cancellation, in
+  ## which case it stays in its Cancelled state and this call leaves it untouched
+  ## (awaiting it raises CancelledError rather than yielding -125).
   let fut = newFuture[int32]("uringCancel")
 
   if u.closed:
@@ -548,35 +779,33 @@ proc uringCancel*(u: UringFileIO, target: Future[int32]): Future[int32] =
 
   let targetId = u.futureToId[targetPtr]
 
-  # Check if target is still unsubmitted — cancel locally without kernel roundtrip
-  var unsubIdx = -1
-  for i, id in u.unsubmitted:
-    if id == targetId:
-      unsubIdx = i
-      break
-
-  if unsubIdx >= 0:
-    u.unsubmitted.delete(unsubIdx)
-    nopifySqe(u.ring, targetId)
-    var comp: Completion
-    if u.pending.pop(targetId, comp):
-      u.futureToId.del(cast[pointer](comp.future))
-      {.cast(raises: []).}:
-        comp.future.complete(-125'i32)
+  # Check if target is still unsubmitted — cancel locally without kernel roundtrip.
+  # Safe during chain construction: dropUnsubmitted neutralizes the SQE in place
+  # (NOP) without queueing a new one, so the chain is not split.
+  if u.dropUnsubmitted(targetId):
+    # Guard against a target already finished by external cancellation.
+    settleIfPending(target, -125'i32)
     fut.complete(0'i32)
     return fut
 
-  # Target is already submitted — ask the kernel to cancel it
-  let sqe = getSqe(u.ring)
-  if sqe == nil:
-    fut.fail(newException(IOError, "io_uring SQ full"))
+  # Target is already submitted — a kernel ASYNC_CANCEL SQE is required. We cannot
+  # queue one mid-chain: IOSQE_IO_LINK links each SQE to the one physically
+  # following it, so the cancel would graft into the open chain — splitting it
+  # (the next user op gets cancelled — data loss) and making endChain return N+1
+  # futures. Reject rather than corrupt the chain; cancel after endChain, or rely
+  # on external (chronos) cancellation, which defers via handleExternalCancel.
+  if u.chainActive:
+    fut.fail(
+      newException(
+        IOError, "cannot cancel a submitted operation during chain construction"
+      )
+    )
     return fut
 
-  sqe.opcode = IORING_OP_ASYNC_CANCEL
-  sqe.`addr` = targetId
-
-  var comp = Completion(future: fut, kind: ckCancel)
-  return queueSqe(u, comp)
+  # Target is already submitted — ask the kernel to cancel it
+  if not u.queueAsyncCancel(targetId, fut):
+    fut.fail(newException(IOError, "io_uring SQ full"))
+  return fut
 
 proc beginChain*(u: UringFileIO) =
   ## Start a linked SQE chain. Subsequent uring* calls will have IOSQE_IO_LINK set.
@@ -597,9 +826,27 @@ proc endChain*(u: UringFileIO): seq[Future[int32]] =
     raise newException(IOError, "no active chain")
   u.chainActive = false
 
-  if u.chainFutures.len == 0:
-    # Empty chain
-    return @[]
+  # Note: do NOT early-return for an "empty" chain (chainFutures and/or chainIds
+  # empty). The common tail below — clearLastSqeFlags when chainIds is non-empty,
+  # the flushScheduled reset/re-arm, and drainDeferredCancels — must run in every
+  # case:
+  #   * A chain whose sole member was cancelled (handleExternalCancel ->
+  #     dropUnsubmitted) empties chainFutures but keeps the member's id in
+  #     chainIds (its SQE is now a NOP, possibly still carrying IOSQE_IO_LINK):
+  #     it needs clearLastSqeFlags or the dangling link cancels the next unrelated
+  #     op. It also needs the unconditional `flushScheduled = false` reset below:
+  #     the chain's scheduled flush may have already fired (returning early while
+  #     chainActive), leaving flushScheduled stuck true with no flush queued, which
+  #     would wedge every later submission. (The NOP's own SQE slot is then left
+  #     unpublished, but the next queued op's flush — submit() now runs even with an
+  #     empty `unsubmitted` — reclaims it; processCqes ignores the stale NOP.)
+  #   * A genuinely empty chain (no ops queued) can still have unsubmitted ops
+  #     queued *before* beginChain whose scheduled flush already fired and
+  #     early-returned while chainActive: it needs the conditional flush re-arm
+  #     (`unsubmitted.len > 0`) or those ops are stranded and every later
+  #     submission wedges.
+  # The branches below guard their SQE work on `chainIds.len > 0`, so an empty
+  # chain falls through harmlessly and returns @[].
 
   if u.chainFailed:
     # Roll back all successfully allocated SQEs
@@ -610,10 +857,7 @@ proc endChain*(u: UringFileIO): seq[Future[int32]] =
         var comp: Completion
         if u.pending.pop(id, comp):
           u.futureToId.del(cast[pointer](comp.future))
-        for i in countdown(u.unsubmitted.high, 0):
-          if u.unsubmitted[i] == id:
-            u.unsubmitted.delete(i)
-            break
+        discard u.removeUnsubmitted(id)
     # Fail all futures
     let err = newException(IOError, "chain aborted: io_uring SQ full")
     for fut in u.chainFutures:
@@ -639,6 +883,11 @@ proc endChain*(u: UringFileIO): seq[Future[int32]] =
           u.flush()
       )
 
+  # The chain is finalized, so kernel cancels deferred while it was open can now
+  # be issued without grafting into it. (Any uringCancel queued here is picked up
+  # by the flush scheduled above, or schedules its own.)
+  u.drainDeferredCancels()
+
 proc newUringFileIO*(entries: uint32 = 256): UringFileIO {.raises: [OSError].} =
   ## Create a new UringFileIO instance. Initializes io_uring and starts poll loop.
   var ring = setupRing(entries)
@@ -662,6 +911,14 @@ proc newUringFileIO*(entries: uint32 = 256): UringFileIO {.raises: [OSError].} =
     pending: initTable[uint64, Completion](),
     closed: false,
   )
+  when hasChronos:
+    # One shared cancel callback per instance (assigned to every op's future),
+    # so arming an op allocates nothing. It recovers `u` from this closure and
+    # the cancelled future from its own argument (chronos passes the future as a
+    # raw pointer).
+    let u = result
+    u.cancelCb = proc(arg: pointer) {.gcsafe, raises: [].} =
+      handleExternalCancel(u, cast[Future[int32]](arg))
   try:
     startPollLoop(result)
   except OSError as e:

@@ -2,8 +2,10 @@
 
 import std/[unittest, os, posix, strutils, importutils]
 
-import ../iori/uring_bridge
-import ../iori/uring_raw
+import ../iori/[uring_bridge, uring_raw]
+
+when hasChronos:
+  import std/tables
 
 privateAccess(UringFileIO)
 
@@ -560,6 +562,491 @@ suite "uring_bridge":
 
     waitFor run()
 
+  when hasChronos:
+    # Regression tests for external (chronos) cancellation of bridge futures.
+    # Without the cancel callback, cancelling a bridge future does not stop the
+    # kernel op: it lingers in `pending` (buffer rooted) and unsubmitted ops are
+    # still flushed and executed. With it, external cancellation settles the
+    # future in the Cancelled state (consistently for submitted and unsubmitted
+    # ops) and the op's CQE is reaped. The `finished` guard in processCqes hardens
+    # the completion path against re-finishing an externally-finished future.
+
+    # Budget for waiting on the kernel -ECANCELED CQE (reaped via the eventfd
+    # poll loop): generous so a loaded CI box does not flake, while a genuinely
+    # dropped cancel still fails the assert because `pending` never drains.
+    const
+      reapIters = 250
+      reapStepMs = 2
+
+    test "chronos cancelAndWait of submitted bridge future reaps op safely":
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          # Pipe read-end blocks until data arrives — the op stays in flight.
+          var fds: array[2, cint]
+          doAssert pipe(fds) == 0
+          let readFd = fds[0]
+          let writeFd = fds[1]
+          defer:
+            discard posix.close(readFd)
+            discard posix.close(writeFd)
+
+          var bufRef = new(seq[byte])
+          bufRef[] = newSeq[byte](64)
+          let readFut = io.uringRead(readFd, addr bufRef[][0], 64, 0'u64, bufRef)
+          io.flush()
+          # `unsubmitted` empty proves flush actually submitted the SQE to the
+          # kernel (the op is in-flight), not merely that it was queued; `pending`
+          # tracks the in-flight Completion.
+          doAssert io.unsubmitted.len == 0
+          doAssert io.pending.len == 1
+
+          # External cancellation: the cancel callback must issue ASYNC_CANCEL, and
+          # chronos moves the future to Cancelled.
+          await readFut.cancelAndWait()
+          doAssert readFut.cancelled()
+
+          # Drive the loop: the kernel cancel CQE (-ECANCELED) must be reaped by
+          # processCqes (skipping completion of the finished future), not crash.
+          for _ in 0 ..< reapIters:
+            if io.pending.len == 0:
+              break
+            await sleepMsAsync(reapStepMs)
+          doAssert io.pending.len == 0, "op not reaped: " & $io.pending.len
+
+      waitFor run()
+
+    test "chronos cancelAndWait of unsubmitted bridge future is safe":
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          let fd = cint(posix.open("/dev/zero", O_RDONLY))
+          doAssert fd >= 0
+          defer:
+            discard posix.close(fd)
+
+          var bufRef = new(seq[byte])
+          bufRef[] = newSeq[byte](64)
+          # No flush — the op stays unsubmitted, so cancellation neutralizes the SQE.
+          let readFut = io.uringRead(fd, addr bufRef[][0], 64, 0'u64, bufRef)
+
+          await readFut.cancelAndWait()
+          doAssert readFut.cancelled()
+
+          # Awaiting a cancelled future raises CancelledError (chronos semantics),
+          # consistent with the submitted-op path — not a -125 value.
+          var raised = false
+          try:
+            discard await readFut
+          except CancelledError:
+            raised = true
+          doAssert raised
+
+          # The unsubmitted path drops the Completion synchronously inside the
+          # cancel callback (no kernel roundtrip, no CQE to wait for), so the
+          # buffer's GC root is already released by the time cancelAndWait
+          # returns. The neutralized SQE was never submitted; if a later op ever
+          # flushes it as a stale NOP, processCqes ignores it (id no longer in
+          # `pending`).
+          doAssert io.pending.len == 0, "completion not dropped: " & $io.pending.len
+
+      waitFor run()
+
+    test "chronos cancel during chain build does not graft into the chain":
+      # Regression: cancelling an unrelated *submitted* op while a linked chain
+      # is mid-construction must NOT insert an ASYNC_CANCEL SQE into the chain.
+      # io_uring's IOSQE_IO_LINK links each SQE to the one physically following
+      # it, so a grafted SQE would split the chain and cancel the next user op
+      # (silent data loss); endChain would also return N+1 futures. The cancel is
+      # deferred until after endChain instead.
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          # An in-flight (submitted) blocking pipe read, cancellable mid-chain.
+          var fds: array[2, cint]
+          doAssert pipe(fds) == 0
+          let readFd = fds[0]
+          let writeFd = fds[1]
+          defer:
+            discard posix.close(readFd)
+            discard posix.close(writeFd)
+
+          var blkRef = new(seq[byte])
+          blkRef[] = newSeq[byte](64)
+          let blockingFut = io.uringRead(readFd, addr blkRef[][0], 64, 0'u64, blkRef)
+          io.flush()
+          doAssert io.unsubmitted.len == 0 # actually submitted (in-flight)
+          doAssert io.pending.len == 1
+
+          let fd = cint(posix.open("/dev/zero", O_RDONLY))
+          doAssert fd >= 0
+          defer:
+            discard posix.close(fd)
+          var b1 = new(seq[byte])
+          b1[] = newSeq[byte](8)
+          var b2 = new(seq[byte])
+          b2[] = newSeq[byte](8)
+
+          # Build a 2-op chain; cancel the unrelated submitted op between the ops.
+          io.beginChain()
+          let f1 = io.uringRead(fd, addr b1[][0], 8, 0'u64, b1)
+          blockingFut.cancelSoon() # fires the cancel callback inline (chainActive)
+          doAssert io.chainFutures.len == 1, "chain grafted: " & $io.chainFutures.len
+          let f2 = io.uringRead(fd, addr b2[][0], 8, 0'u64, b2)
+          let futs = io.endChain()
+          doAssert futs.len == 2, "endChain returned " & $futs.len & " futures (want 2)"
+
+          # The chain ops still run correctly (8 zero bytes each from /dev/zero).
+          let r1 = await f1
+          let r2 = await f2
+          doAssert r1 == 8, "f1: " & $r1
+          doAssert r2 == 8, "f2: " & $r2
+
+          # The cancelled op settles Cancelled; its deferred ASYNC_CANCEL reaps it.
+          doAssert blockingFut.cancelled()
+          for _ in 0 ..< reapIters:
+            if io.pending.len == 0:
+              break
+            await sleepMsAsync(reapStepMs)
+          doAssert io.pending.len == 0, "op not reaped: " & $io.pending.len
+
+      waitFor run()
+
+    test "chronos cancel of submitted op during a tick-spanning chain still reaps":
+      # Regression for the deferred-cancel drop: when the cancel of an
+      # unrelated *submitted* op arrives mid-chain, it is deferred until the
+      # chain closes. If the chain outlives the tick on which the cancel fired
+      # (the consumer awaits while the chain is open), the deferred cancel must
+      # retry — not silently give up — or the kernel op is never cancelled and
+      # its buffer stays GC-rooted in `pending` forever.
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          var fds: array[2, cint]
+          doAssert pipe(fds) == 0
+          let readFd = fds[0]
+          let writeFd = fds[1]
+          defer:
+            discard posix.close(readFd)
+            discard posix.close(writeFd)
+
+          var blkRef = new(seq[byte])
+          blkRef[] = newSeq[byte](64)
+          let blockingFut = io.uringRead(readFd, addr blkRef[][0], 64, 0'u64, blkRef)
+          io.flush()
+          doAssert io.unsubmitted.len == 0
+          doAssert io.pending.len == 1
+
+          let fd = cint(posix.open("/dev/zero", O_RDONLY))
+          doAssert fd >= 0
+          defer:
+            discard posix.close(fd)
+          var b1 = new(seq[byte])
+          b1[] = newSeq[byte](8)
+          var b2 = new(seq[byte])
+          b2[] = newSeq[byte](8)
+
+          io.beginChain()
+          let f1 = io.uringRead(fd, addr b1[][0], 8, 0'u64, b1)
+          blockingFut.cancelSoon() # deferred (chainActive)
+          await sleepMsAsync(10) # chain spans a tick: deferred cancel must retry
+          let f2 = io.uringRead(fd, addr b2[][0], 8, 0'u64, b2)
+          let futs = io.endChain()
+          doAssert futs.len == 2, "endChain returned " & $futs.len & " futures (want 2)"
+
+          let r1 = await f1
+          let r2 = await f2
+          doAssert r1 == 8, "f1: " & $r1
+          doAssert r2 == 8, "f2: " & $r2
+
+          doAssert blockingFut.cancelled()
+          for _ in 0 ..< reapIters:
+            if io.pending.len == 0:
+              break
+            await sleepMsAsync(reapStepMs)
+          doAssert io.pending.len == 0, "deferred cancel dropped: " & $io.pending.len
+
+      waitFor run()
+
+    test "chronos cancel of submitted op when SQ is full defers and reaps":
+      # Regression: if the SQ ring is full at the moment of external cancellation,
+      # the kernel ASYNC_CANCEL cannot be queued immediately (getSqe returns nil).
+      # It must be deferred and retried after the next flush frees a slot — not
+      # silently dropped, which would leave the op running with its buffer
+      # GC-rooted in `pending` forever.
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          # entries=4 (CQ has 8 slots, ample headroom); SQ capacity equals the
+          # requested entries, so 4 unsubmitted ops fill it exactly.
+          const ringEntries = 4
+          let io2 = newUringFileIO(ringEntries)
+          defer:
+            io2.close()
+
+          var fds: array[2, cint]
+          doAssert pipe(fds) == 0
+          let readFd = fds[0]
+          let writeFd = fds[1]
+          defer:
+            discard posix.close(readFd)
+            discard posix.close(writeFd)
+
+          # A submitted, in-flight blocking pipe read — the op to cancel.
+          var blkRef = new(seq[byte])
+          blkRef[] = newSeq[byte](64)
+          let blockingFut = io2.uringRead(readFd, addr blkRef[][0], 64, 0'u64, blkRef)
+          io2.flush()
+          doAssert io2.unsubmitted.len == 0
+          doAssert io2.pending.len == 1
+
+          # Fill every SQ slot with unsubmitted reads so the getSqe inside
+          # uringCancel returns nil (SQ full).
+          let fd = cint(posix.open("/dev/zero", O_RDONLY))
+          doAssert fd >= 0
+          defer:
+            discard posix.close(fd)
+          var fillFuts: seq[Future[int32]]
+          var fillBufs: seq[ref seq[byte]] # keep buffers GC-rooted
+          for _ in 0 ..< ringEntries:
+            var fb = new(seq[byte])
+            fb[] = newSeq[byte](8)
+            fillBufs.add(fb)
+            fillFuts.add(io2.uringRead(fd, addr fb[][0], 8, 0'u64, fb))
+          doAssert io2.unsubmitted.len == ringEntries
+
+          # Cancel the submitted op: the kernel cancel can't be issued now (SQ
+          # full), so it must be deferred rather than dropped. cancelSoon fires
+          # handleExternalCancel inline, before the fill ops' scheduled flush can
+          # free a slot, so the SQ-full path is exercised deterministically. A
+          # deferredCancels.len of 0 here would mean the SQ was not actually full.
+          blockingFut.cancelSoon()
+          doAssert blockingFut.cancelled()
+          doAssert io2.deferredCancels.len == 1,
+            "SQ-full cancel not deferred: " & $io2.deferredCancels.len
+
+          # Awaiting the fill reads flushes them, freeing slots and draining the
+          # deferred cancel; its ASYNC_CANCEL then reaps the blocking op.
+          for f in fillFuts:
+            doAssert (await f) == 8
+          for _ in 0 ..< reapIters:
+            if io2.pending.len == 0:
+              break
+            await sleepMsAsync(reapStepMs)
+          doAssert io2.pending.len == 0,
+            "deferred SQ-full cancel dropped: " & $io2.pending.len
+          doAssert io2.deferredCancels.len == 0,
+            "deferred cancel not cleared: " & $io2.deferredCancels.len
+
+      waitFor run()
+
+    test "chronos cancel of submitted op then empty endChain still reaps":
+      # Regression: a cancel deferred because a chain was open must still be
+      # issued when that chain closes EMPTY (no ops queued). endChain's empty-
+      # chain path used to return before draining, stranding the kernel op with
+      # its buffer GC-rooted in `pending` forever.
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          var fds: array[2, cint]
+          doAssert pipe(fds) == 0
+          let readFd = fds[0]
+          let writeFd = fds[1]
+          defer:
+            discard posix.close(readFd)
+            discard posix.close(writeFd)
+
+          var blkRef = new(seq[byte])
+          blkRef[] = newSeq[byte](64)
+          let blockingFut = io.uringRead(readFd, addr blkRef[][0], 64, 0'u64, blkRef)
+          io.flush()
+          doAssert io.unsubmitted.len == 0
+          doAssert io.pending.len == 1
+
+          # Open a chain, cancel the unrelated submitted op (deferred because
+          # chainActive), then close the chain WITHOUT queueing any op.
+          io.beginChain()
+          blockingFut.cancelSoon()
+          doAssert blockingFut.cancelled()
+          doAssert io.deferredCancels.len == 1,
+            "cancel not deferred: " & $io.deferredCancels.len
+          let futs = io.endChain()
+          doAssert futs.len == 0
+
+          # The empty endChain must have drained the deferred cancel and reaped
+          # the op — not stranded it.
+          for _ in 0 ..< reapIters:
+            if io.pending.len == 0:
+              break
+            await sleepMsAsync(reapStepMs)
+          doAssert io.pending.len == 0,
+            "empty endChain stranded the cancel: " & $io.pending.len
+          doAssert io.deferredCancels.len == 0
+
+      waitFor run()
+
+    test "chronos cancel of unsubmitted chain member is excluded from endChain":
+      # Regression: cancelling a future that belongs to the chain being built
+      # drops it from the returned future set (its SQE becomes a linked NOP)
+      # while the rest of the chain still executes. endChain previously returned
+      # the already-Cancelled member future and an off-by-one count.
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          let fd = cint(posix.open("/dev/zero", O_RDONLY))
+          doAssert fd >= 0
+          defer:
+            discard posix.close(fd)
+          var b1 = new(seq[byte])
+          b1[] = newSeq[byte](8)
+          var b2 = new(seq[byte])
+          b2[] = newSeq[byte](8)
+
+          io.beginChain()
+          let f1 = io.uringRead(fd, addr b1[][0], 8, 0'u64, b1)
+          let f2 = io.uringRead(fd, addr b2[][0], 8, 0'u64, b2)
+          f1.cancelSoon() # cancel a member mid-build
+          doAssert f1.cancelled()
+          let futs = io.endChain()
+          doAssert futs.len == 1,
+            "endChain should exclude the cancelled member: " & $futs.len
+
+          # The surviving op still runs (8 zero bytes from /dev/zero); the chain
+          # link is intact (the cancelled member is a linked NOP).
+          let r2 = await f2
+          doAssert r2 == 8, "f2: " & $r2
+
+          for _ in 0 ..< reapIters:
+            if io.pending.len == 0:
+              break
+            await sleepMsAsync(reapStepMs)
+          doAssert io.pending.len == 0, "pending not drained: " & $io.pending.len
+
+      waitFor run()
+
+    test "chronos cancel of sole chain member then empty endChain unblocks later ops":
+      # Regression: cancelling the ONLY member of an in-build chain empties
+      # chainFutures while its id stays in chainIds (its SQE is now a linked NOP).
+      # endChain must NOT take the truly-empty early return — it has to clear the
+      # dangling IOSQE_IO_LINK and re-arm flushScheduled, or later ops never flush.
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          let fd = cint(posix.open("/dev/zero", O_RDONLY))
+          doAssert fd >= 0
+          defer:
+            discard posix.close(fd)
+
+          var b1 = new(seq[byte])
+          b1[] = newSeq[byte](8)
+          io.beginChain()
+          let f1 = io.uringRead(fd, addr b1[][0], 8, 0'u64, b1)
+          f1.cancelSoon() # sole member cancelled mid-build
+          doAssert f1.cancelled()
+          let futs = io.endChain()
+          doAssert futs.len == 0
+
+          # A later unrelated op must still submit and complete.
+          var b2 = new(seq[byte])
+          b2[] = newSeq[byte](8)
+          let g = io.uringRead(fd, addr b2[][0], 8, 0'u64, b2)
+          let rg = await g
+          doAssert rg == 8, "later op did not run: " & $rg
+
+      waitFor run()
+
+    test "chronos cancel of all chain members across a tick does not wedge submission":
+      # Regression for the endChain empty-chain wedge: once the chain's scheduled
+      # flush has already fired (returning early because chainActive) and then
+      # every member is cancelled, the old `chainFutures.len == 0` early return
+      # skipped the flushScheduled re-arm — leaving flushScheduled stuck true with
+      # no flush pending, so every subsequent op stayed unsubmitted forever.
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          let fd = cint(posix.open("/dev/zero", O_RDONLY))
+          doAssert fd >= 0
+          defer:
+            discard posix.close(fd)
+
+          var b1 = new(seq[byte])
+          b1[] = newSeq[byte](8)
+          io.beginChain()
+          let f1 = io.uringRead(fd, addr b1[][0], 8, 0'u64, b1)
+          # Span a tick so the chain's scheduled flush fires while chainActive
+          # (it returns early, leaving flushScheduled = true with no flush queued).
+          await sleepMsAsync(10)
+          f1.cancelSoon() # cancel the sole member
+          doAssert f1.cancelled()
+          let futs = io.endChain()
+          doAssert futs.len == 0
+
+          # A later op must submit and complete within a bounded budget; if the
+          # instance is wedged it never finishes.
+          var b2 = new(seq[byte])
+          b2[] = newSeq[byte](8)
+          let g = io.uringRead(fd, addr b2[][0], 8, 0'u64, b2)
+          var done = false
+          for _ in 0 ..< reapIters:
+            if g.finished:
+              done = true
+              break
+            await sleepMsAsync(reapStepMs)
+          doAssert done, "submission wedged: later op never completed"
+          doAssert g.read() == 8
+
+      waitFor run()
+
+    test "chronos cancel survives a submit() failure that rolls back its ASYNC_CANCEL":
+      # Regression: when the kernel ASYNC_CANCEL for an externally-cancelled
+      # submitted op is queued but the very next submit() fails, io_uring_enter
+      # rolls the SQ ring back and the ASYNC_CANCEL is discarded. tryKernelCancel
+      # had already reported success (so the target was not in deferredCancels), so
+      # without the flush-failure re-defer the cancel was lost forever: the kernel
+      # op kept running and its Completion+buffer stayed GC-rooted in `pending`.
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          let io2 = newUringFileIO(32)
+          defer:
+            io2.close()
+
+          # A submitted, in-flight blocking pipe read — the op to cancel.
+          var fds: array[2, cint]
+          doAssert pipe(fds) == 0
+          let readFd = fds[0]
+          let writeFd = fds[1]
+          defer:
+            discard posix.close(readFd)
+            discard posix.close(writeFd)
+
+          var blkRef = new(seq[byte])
+          blkRef[] = newSeq[byte](64)
+          let blockingFut = io2.uringRead(readFd, addr blkRef[][0], 64, 0'u64, blkRef)
+          io2.flush()
+          doAssert io2.unsubmitted.len == 0
+          doAssert io2.pending.len == 1
+
+          # Cancel inline: handleExternalCancel queues an ASYNC_CANCEL (now sitting
+          # in `unsubmitted`); the target is NOT in deferredCancels because
+          # tryKernelCancel reported the queued cancel as success.
+          blockingFut.cancelSoon()
+          doAssert blockingFut.cancelled()
+          doAssert io2.unsubmitted.len == 1
+          doAssert io2.deferredCancels.len == 0
+
+          # Force the flush that would submit the ASYNC_CANCEL to fail: the SQ ring
+          # rolls back and the ASYNC_CANCEL is discarded. The re-defer must put the
+          # still-pending Cancelled target back into deferredCancels.
+          let savedFd = io2.ring.ringFd
+          io2.ring.ringFd = -1
+          io2.flush()
+          io2.ring.ringFd = savedFd
+
+          # The ASYNC_CANCEL op's own future was failed and dropped, but the target
+          # must have been re-deferred (or already re-issued by the in-flush drain),
+          # so its kernel op is eventually cancelled and `pending` drains. Without
+          # the fix it stays at 1 forever.
+          for _ in 0 ..< reapIters:
+            if io2.pending.len == 0:
+              break
+            await sleepMsAsync(reapStepMs)
+          doAssert io2.pending.len == 0,
+            "submit-failure dropped the cancel; op leaked in pending: " &
+              $io2.pending.len
+
+      waitFor run()
+
   test "uringStatxFd returns correct size for open fd":
     proc run() {.async.} =
       {.cast(gcsafe).}:
@@ -851,6 +1338,110 @@ suite "uring_bridge":
         let n = posix.read(readFd, addr checkBuf[0], 4)
         doAssert n <= 0,
           "stale SQE was submitted to kernel: pipe contains " & $n & " bytes"
+
+    waitFor run()
+
+  test "empty endChain re-arms a pre-chain flush (no submission wedge)":
+    ## Regression: a pre-chain unsubmitted op whose scheduled flush already fired
+    ## (and early-returned because chainActive) while a chain was open must still
+    ## be submitted when that chain closes empty. endChain's old empty-chain early
+    ## return skipped the flushScheduled re-arm, stranding the op in `unsubmitted`
+    ## and wedging every later submission (flushScheduled stuck true forever).
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        let fd = cint(posix.open("/dev/null", O_WRONLY))
+        doAssert fd >= 0
+        defer:
+          discard posix.close(fd)
+
+        var bufRef = new(seq[byte])
+        bufRef[] = @[byte 1, 2, 3, 4]
+
+        # Queue a write OUTSIDE any chain — schedules a flush (flushScheduled=true).
+        let a = io.uringWrite(fd, addr bufRef[][0], 4, 0'u64, bufRef)
+        # Open an empty chain, then span a tick so the pre-chain flush fires while
+        # chainActive (it early-returns, leaving flushScheduled stuck true and `a`
+        # unsubmitted).
+        io.beginChain()
+        await sleepMsAsync(10)
+        # Close the chain WITHOUT queueing any op — the empty-chain path must still
+        # re-arm the flush so `a` is submitted.
+        let futs = io.endChain()
+        doAssert futs.len == 0
+
+        # `a` must complete within a bounded budget; a wedge leaves it pending forever.
+        var done = false
+        for _ in 0 ..< 250:
+          if a.finished:
+            done = true
+            break
+          await sleepMsAsync(2)
+        doAssert done, "pre-chain op stranded: empty endChain did not re-arm flush"
+        doAssert (await a) == 4, "write should have completed with 4 bytes"
+
+    waitFor run()
+
+  test "uringCancel of submitted op during chain construction is rejected":
+    ## Regression: cancelling a *submitted* op via the public uringCancel while a
+    ## chain is being built must NOT graft an ASYNC_CANCEL SQE into the chain
+    ## (IOSQE_IO_LINK would link it in, splitting the chain and making endChain
+    ## return N+1 futures). It is rejected with IOError; the chain stays intact.
+    proc run() {.async.} =
+      {.cast(gcsafe).}:
+        # A submitted, in-flight blocking pipe read — the op to cancel.
+        var fds: array[2, cint]
+        doAssert pipe(fds) == 0
+        let readFd = fds[0]
+        let writeFd = fds[1]
+        defer:
+          discard posix.close(readFd)
+          discard posix.close(writeFd)
+
+        var blkRef = new(seq[byte])
+        blkRef[] = newSeq[byte](64)
+        let blockingFut = io.uringRead(readFd, addr blkRef[][0], 64, 0'u64, blkRef)
+        io.flush()
+        doAssert io.unsubmitted.len == 0 # actually submitted (in-flight)
+
+        let fd = cint(posix.open("/dev/zero", O_RDONLY))
+        doAssert fd >= 0
+        defer:
+          discard posix.close(fd)
+        var b1 = new(seq[byte])
+        b1[] = newSeq[byte](8)
+        var b2 = new(seq[byte])
+        b2[] = newSeq[byte](8)
+
+        io.beginChain()
+        let f1 = io.uringRead(fd, addr b1[][0], 8, 0'u64, b1)
+        # Public uringCancel of the submitted op mid-chain must be rejected
+        # synchronously, not grafted: the returned future is already failed and
+        # chainFutures stays at 1 (only f1), not 2. Check synchronously (no await)
+        # so the unfixed/grafted case fails cleanly here instead of deadlocking on
+        # an await of a future stranded inside the still-open chain.
+        let cancelFut = io.uringCancel(blockingFut)
+        doAssert cancelFut.failed,
+          "uringCancel of submitted op mid-chain should be rejected synchronously"
+        doAssert io.chainFutures.len == 1,
+          "cancel grafted into chain: " & $io.chainFutures.len
+        var rejected = false
+        try:
+          discard await cancelFut
+        except IOError:
+          rejected = true
+        doAssert rejected, "rejected cancel future should carry IOError"
+        let f2 = io.uringRead(fd, addr b2[][0], 8, 0'u64, b2)
+        let futs = io.endChain()
+        doAssert futs.len == 2, "endChain returned " & $futs.len & " futures (want 2)"
+
+        # The chain ops still run correctly (8 zero bytes each from /dev/zero).
+        doAssert (await f1) == 8, "f1"
+        doAssert (await f2) == 8, "f2"
+
+        # The blocking op was never cancelled (the cancel was rejected) and is
+        # still in flight; cancel it now, outside the chain, to drain it.
+        doAssert (await io.uringCancel(blockingFut)) == 0
+        doAssert (await blockingFut) == -125
 
     waitFor run()
 
