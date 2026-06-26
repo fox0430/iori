@@ -53,6 +53,14 @@ nim c -d:asyncBackend=chronos -r examples/simple.nim
 
 https://fox0430.github.io/iori/iori.html
 
+## See also
+
+If you use [Chronos](https://github.com/status-im/nim-chronos) and want broader
+platform support, check out [chronos-file](https://github.com/fox0430/chronos-file).
+It is an async file I/O library for Chronos that works on POSIX systems using
+`pread`/`pwrite`, with an optional io_uring backend (Linux 5.6+) for truly async
+seekable I/O.
+
 ## TODO
 
 - SQ polling (`IORING_SETUP_SQPOLL`)
