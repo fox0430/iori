@@ -18,7 +18,16 @@ type Operation = enum
   statx = "statx"
   write = "write"
 
-const ECANCELED = 125'i32
+const
+  ECANCELED = 125'i32
+  ERESTARTSYS = 512'i32
+    # Kernel-internal restart errno: the op was interrupted — io_uring reports it
+    # instead of -ECANCELED for some op types (observed: cancelled openat on a FIFO).
+
+proc isCancelResult(res: int32): bool =
+  ## Whether the CQE result means the op was cancelled/interrupted rather than
+  ## completed (awaitOrTimeout adopts real results only).
+  res == -ECANCELED or res == -posix.EINTR.int32 or res == -ERESTARTSYS
 
 template raiseOnError(res: int32, op: Operation) =
   ## Raise CancelledError for -ECANCELED, IOError for other negative results.
@@ -27,49 +36,114 @@ template raiseOnError(res: int32, op: Operation) =
       raise (ref CancelledError)(msg: $op & " cancelled")
     raise newException(IOError, $op & " failed: " & osErrorMsg(OSErrorCode(-res)))
 
+proc issueTimeoutCancel(u: UringFileIO, fut: Future[int32]) {.async.} =
+  ## Cancel `fut` in the kernel, retrying while the SQ is full or a chain is
+  ## open, until the cancel is issued or `fut` settles.
+  while not fut.finished:
+    var issued = false
+    try:
+      discard await uringCancel(u, fut)
+      issued = true
+    except IOError:
+      discard
+    if issued or fut.finished:
+      return
+    # SQ full / chain open: retry after a tick.
+    await sleepMsAsync(1)
+
+proc timeoutWatcher(
+    u: UringFileIO, fut: Future[int32], ms: int64, mark: Future[void]
+) {.async.} =
+  ## Timer side of `awaitOrTimeout`: on expiry, mark the timeout and cancel the
+  ## still-pending kernel op.
+  if ms > 0:
+    await sleepMsAsync(int(ms))
+  if fut.finished:
+    return
+  mark.complete()
+  await issueTimeoutCancel(u, fut)
+
 proc awaitOrTimeout(
     u: UringFileIO, fut: Future[int32], deadline: MonoTime, op: Operation
 ): Future[int32] {.async.} =
-  ## Await a bridge-level Future with a deadline. If the deadline passes before
-  ## `fut` completes, cancel the underlying io_uring operation and raise TimeoutError.
-  let remaining = deadline - getMonoTime()
-  let ms = remaining.inMilliseconds
-  if ms <= 0:
-    # Already past deadline — cancel immediately
-    var cancelled = false
-    try:
-      discard await uringCancel(u, fut)
-      cancelled = true
-    except IOError:
-      discard
-    # Only drain if cancel succeeded; otherwise the operation may block indefinitely
-    if cancelled:
-      try:
-        discard await fut
-      except CatchableError:
-        discard
-    raise newException(TimeoutError, $op & " timed out")
+  ## Await a bridge-level Future with a deadline. External cancellation of the
+  ## caller propagates to the kernel op. On expiry the op is cancelled and
+  ## TimeoutError is raised — unless it actually completed, in which case its
+  ## real result is adopted.
+  let ms = (deadline - getMonoTime()).inMilliseconds
+  let mark = newFuture[void]("timeoutMark")
+  let watcher = timeoutWatcher(u, fut, ms, mark)
+  try:
+    let res = await fut
+    if mark.finished and isCancelResult(res):
+      raise newException(TimeoutError, $op & " timed out")
+    return res
+  finally:
+    cancelTimer(watcher)
+    if not mark.finished:
+      mark.complete()
 
-  let timer = sleepMsAsync(int(ms))
-  await fut or timer
-  if fut.finished:
-    cancelTimer(timer)
-    return await fut
-  else:
-    # Timer fired first — cancel the operation
-    var cancelled = false
-    try:
-      discard await uringCancel(u, fut)
-      cancelled = true
-    except IOError:
-      discard
-    # Only drain if cancel succeeded; otherwise the operation may block indefinitely
-    if cancelled:
-      try:
-        discard await fut
-      except CatchableError:
-        discard
+proc boundedDrain(fut: Future[int32], bridge: Future[int32]) {.async.} =
+  ## Mirror the outcome of `fut` into `bridge`, unless the wait already ended.
+  try:
+    let res = await fut
+    if not bridge.finished:
+      bridge.complete(res)
+  except CatchableError as e:
+    if not bridge.finished:
+      bridge.fail(e)
+
+proc boundedTimer(ms: int, bridge: Future[int32], op: Operation) {.async.} =
+  ## Timer side of `awaitBounded`: end the wait with TimeoutError on expiry.
+  await sleepMsAsync(ms)
+  if not bridge.finished:
+    bridge.fail(newException(TimeoutError, $op & " timed out"))
+
+proc awaitBounded(
+    u: UringFileIO, fut: Future[int32], deadline: MonoTime, op: Operation
+): Future[int32] {.async.} =
+  ## Await `fut`, but no longer than `deadline`. On expiry, raise TimeoutError
+  ## *without cancelling* `fut`: it keeps running in the background. Close-only —
+  ## cancelling a close would leak the fd (or fixed-file slot), and an unbounded
+  ## wait would hang on a stuck filesystem. External cancellation of the caller
+  ## ends the wait and leaves `fut` running as well.
+  if deadline == default(MonoTime):
+    # No deadline: await through a bridge so external cancellation cannot kill
+    # the close mid-flight with the fd still open.
+    let bridge = newFuture[int32]("awaitBounded")
+    discard boundedDrain(fut, bridge)
+    return await bridge
+  let ms = (deadline - getMonoTime()).inMilliseconds
+  if ms <= 0:
+    # Deadline passed: drain an already-settled future; flush a queued-but-
+    # unsubmitted op so it runs in the background.
+    if fut.finished:
+      return await fut
+    u.flush()
     raise newException(TimeoutError, $op & " timed out")
+  let bridge = newFuture[int32]("awaitBounded")
+  discard boundedDrain(fut, bridge)
+  let timer = boundedTimer(int(ms), bridge, op)
+  try:
+    return await bridge
+  finally:
+    cancelTimer(timer)
+
+proc releaseSlotOnSettle(
+    u: UringFileIO, slot: int32, fut: Future[int32]
+) {.raises: [].} =
+  ## Release fixed file slot `slot` once `fut` settles — a lingering closeDirect
+  ## must not close the file that a new operation installs in the slot.
+  {.cast(raises: []).}:
+    if fut.finished:
+      u.freeFixedFileSlot(slot)
+      return
+    fut.onComplete(
+      proc() {.gcsafe, raises: [].} =
+        {.cast(gcsafe).}:
+          {.cast(raises: []).}:
+            u.freeFixedFileSlot(slot)
+    )
 
 template awaitMaybeTimeout(
     u: UringFileIO, fut: untyped, deadline: MonoTime, op: Operation
@@ -85,7 +159,9 @@ proc readFile*(
 ): Future[seq[byte]] {.async.} =
   ## Read entire file contents. Uses statx to determine file size, then reads
   ## in a loop to handle partial reads.
-  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  ## If timeoutMs > 0, raises TimeoutError when the deadline passes (a result
+  ## that completed meanwhile is adopted). A timed-out close keeps running in
+  ## the background.
   let deadline =
     if timeoutMs > 0:
       getMonoTime() + initDuration(milliseconds = timeoutMs)
@@ -110,7 +186,8 @@ proc readFile*(
 
     if fileSize <= 0:
       closed = true
-      let closeRes = await uringClose(u, fd.cint)
+      let closeRes =
+        await awaitBounded(u, uringClose(u, fd.cint), deadline, Operation.close)
       raiseOnError(closeRes, Operation.close)
       return @[]
 
@@ -118,7 +195,7 @@ proc readFile*(
     bufRef[] = newSeq[byte](fileSize)
 
     if fileSize <= int(high(uint32)):
-      # Single read: chain read → close
+      # Single read: chain read -> close
       u.beginChain()
       let readFut =
         uringRead(u, fd.cint, addr bufRef[][0], uint32(fileSize), 0'u64, bufRef)
@@ -131,7 +208,7 @@ proc readFile*(
       bufRef[].setLen(totalRead)
 
       closed = true
-      let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+      let closeRes = await awaitBounded(u, closeFut, deadline, Operation.close)
       raiseOnError(closeRes, Operation.close)
       return bufRef[]
     else:
@@ -154,22 +231,35 @@ proc readFile*(
         )
         if readRes <= 0:
           closed = true
-          let closeRes = await uringClose(u, fd.cint)
+          var closeTimedOut = false
+          var closeRes = 0'i32
+          try:
+            closeRes =
+              await awaitBounded(u, uringClose(u, fd.cint), deadline, Operation.close)
+          except TimeoutError:
+            closeTimedOut = true
+          # The read outcome takes precedence over the close outcome.
           raiseOnError(readRes, Operation.read)
+          if closeTimedOut:
+            raise newException(TimeoutError, $Operation.close & " timed out")
           raiseOnError(closeRes, Operation.close)
           bufRef[].setLen(totalRead)
           return bufRef[]
         totalRead += readRes.int
 
       closed = true
-      let closeRes = await uringClose(u, fd.cint)
+      let closeRes =
+        await awaitBounded(u, uringClose(u, fd.cint), deadline, Operation.close)
       raiseOnError(closeRes, Operation.close)
 
       bufRef[].setLen(totalRead)
       return bufRef[]
   finally:
     if not closed:
-      discard await uringClose(u, fd.cint)
+      try:
+        discard await awaitBounded(u, uringClose(u, fd.cint), deadline, Operation.close)
+      except CatchableError:
+        discard
 
 proc writeFile*(
     u: UringFileIO,
@@ -184,7 +274,9 @@ proc writeFile*(
   ## If dataOnly is true, the post-write fsync uses fdatasync semantics
   ## (only file data is flushed, not non-essential metadata). Ignored if
   ## fsync is false.
-  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  ## If timeoutMs > 0, raises TimeoutError when the deadline passes (a result
+  ## that completed meanwhile is adopted). A timed-out close keeps running in
+  ## the background.
   let deadline =
     if timeoutMs > 0:
       getMonoTime() + initDuration(milliseconds = timeoutMs)
@@ -201,7 +293,7 @@ proc writeFile*(
   var closed = false
   try:
     if data.len > 0 and data.len <= int(high(uint32)):
-      # Single write: chain write → (fsync →) close
+      # Single write: chain write -> (fsync ->) close
       var dataRef = new(seq[byte])
       dataRef[] = data
       var fsyncFut: Future[int32]
@@ -225,7 +317,7 @@ proc writeFile*(
         raiseOnError(fsyncRes, Operation.fsync)
 
       closed = true
-      let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+      let closeRes = await awaitBounded(u, closeFut, deadline, Operation.close)
       raiseOnError(closeRes, Operation.close)
     elif data.len > 0:
       # Multi-write loop
@@ -249,12 +341,17 @@ proc writeFile*(
         )
         if writeRes <= 0:
           closed = true
-          discard await uringClose(u, fd.cint)
+          try:
+            discard
+              await awaitBounded(u, uringClose(u, fd.cint), deadline, Operation.close)
+          except TimeoutError:
+            # The write outcome takes precedence over a close timeout.
+            discard
           raiseOnError(writeRes, Operation.write)
           raise newException(IOError, "write stalled: 0 bytes written")
         written += writeRes.int
 
-      # Chain fsync → close or just close
+      # Chain fsync -> close or just close
       if fsync:
         u.beginChain()
         let fsyncFut = uringFsync(u, fd.cint, dataOnly)
@@ -264,12 +361,12 @@ proc writeFile*(
         let fsyncRes = awaitMaybeTimeout(u, fsyncFut, deadline, Operation.fsync)
         raiseOnError(fsyncRes, Operation.fsync)
         closed = true
-        let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+        let closeRes = await awaitBounded(u, closeFut, deadline, Operation.close)
         raiseOnError(closeRes, Operation.close)
       else:
         closed = true
         let closeRes =
-          awaitMaybeTimeout(u, uringClose(u, fd.cint), deadline, Operation.close)
+          await awaitBounded(u, uringClose(u, fd.cint), deadline, Operation.close)
         raiseOnError(closeRes, Operation.close)
     else:
       # Empty data
@@ -282,22 +379,27 @@ proc writeFile*(
         let fsyncRes = awaitMaybeTimeout(u, fsyncFut, deadline, Operation.fsync)
         raiseOnError(fsyncRes, Operation.fsync)
         closed = true
-        let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+        let closeRes = await awaitBounded(u, closeFut, deadline, Operation.close)
         raiseOnError(closeRes, Operation.close)
       else:
         closed = true
         let closeRes =
-          awaitMaybeTimeout(u, uringClose(u, fd.cint), deadline, Operation.close)
+          await awaitBounded(u, uringClose(u, fd.cint), deadline, Operation.close)
         raiseOnError(closeRes, Operation.close)
   finally:
     if not closed:
-      discard await uringClose(u, fd.cint)
+      try:
+        discard await awaitBounded(u, uringClose(u, fd.cint), deadline, Operation.close)
+      except CatchableError:
+        discard
 
 proc readFileString*(
     u: UringFileIO, path: string, timeoutMs: int = 0
 ): Future[string] {.async.} =
   ## Read entire file as string. Raises IOError on failure.
-  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  ## If timeoutMs > 0, raises TimeoutError when the deadline passes (a result
+  ## that completed meanwhile is adopted). A timed-out close keeps running in
+  ## the background.
   let bytes = await readFile(u, path, timeoutMs)
   var s = newString(bytes.len)
   if bytes.len > 0:
@@ -315,7 +417,9 @@ proc writeFileString*(
   ## Write string to file. Creates/truncates file. Raises IOError on failure.
   ## If fsync is false, skip the fsync call after writing.
   ## If dataOnly is true, the post-write fsync uses fdatasync semantics.
-  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  ## If timeoutMs > 0, raises TimeoutError when the deadline passes (a result
+  ## that completed meanwhile is adopted). A timed-out close keeps running in
+  ## the background.
   var bytes = newSeq[byte](data.len)
   if data.len > 0:
     copyMem(addr bytes[0], unsafeAddr data[0], data.len)
@@ -327,8 +431,10 @@ proc readFileDirect*(
     u: UringFileIO, path: string, timeoutMs: int = 0
 ): Future[seq[byte]] {.async.} =
   ## Read entire file using direct descriptors. Requires `registerFixedFileSlots`.
-  ## Chains openDirect → readFixedFile → closeDirect in a single submission (2 syscalls).
-  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  ## Chains openDirect -> readFixedFile -> closeDirect in a single submission (2 syscalls).
+  ## If timeoutMs > 0, raises TimeoutError when the deadline passes (a result
+  ## that completed meanwhile is adopted). A timed-out close keeps running in
+  ## the background.
   let deadline =
     if timeoutMs > 0:
       getMonoTime() + initDuration(milliseconds = timeoutMs)
@@ -348,10 +454,12 @@ proc readFileDirect*(
 
   let slot = allocFixedFileSlot(u)
   var slotHasFile = false
+  var closeInFlight: Future[int32]
+    # closeDirect in flight; the slot must not be reused until it settles.
 
   try:
     if fileSize <= int(high(uint32)):
-      # Single chain: openDirect → readFixedFile → closeDirect
+      # Single chain: openDirect -> readFixedFile -> closeDirect
       var bufRef = new(seq[byte])
       bufRef[] = newSeq[byte](fileSize)
 
@@ -373,7 +481,8 @@ proc readFileDirect*(
       let totalRead = readRes.int
       bufRef[].setLen(totalRead)
 
-      let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+      closeInFlight = closeFut
+      let closeRes = await awaitBounded(u, closeFut, deadline, Operation.close)
       if closeRes == 0:
         slotHasFile = false
       raiseOnError(closeRes, Operation.close)
@@ -412,8 +521,8 @@ proc readFileDirect*(
           break
         totalRead += readRes.int
 
-      let closeRes =
-        awaitMaybeTimeout(u, u.uringCloseDirect(slot), deadline, Operation.close)
+      closeInFlight = u.uringCloseDirect(slot)
+      let closeRes = await awaitBounded(u, closeInFlight, deadline, Operation.close)
       if closeRes == 0:
         slotHasFile = false
       raiseOnError(closeRes, Operation.close)
@@ -421,9 +530,19 @@ proc readFileDirect*(
       bufRef[].setLen(totalRead)
       return bufRef[]
   finally:
-    if slotHasFile:
-      discard await u.uringCloseDirect(slot)
-    freeFixedFileSlot(u, slot)
+    if closeInFlight != nil and not closeInFlight.finished:
+      # closeDirect still in flight: release the slot when it settles (a second
+      # close would double-close it).
+      releaseSlotOnSettle(u, slot, closeInFlight)
+    elif slotHasFile:
+      let closeFut = u.uringCloseDirect(slot)
+      try:
+        discard await awaitBounded(u, closeFut, deadline, Operation.close)
+      except CatchableError:
+        discard
+      releaseSlotOnSettle(u, slot, closeFut)
+    else:
+      freeFixedFileSlot(u, slot)
 
 proc writeFileDirect*(
     u: UringFileIO,
@@ -434,12 +553,14 @@ proc writeFileDirect*(
     dataOnly: bool = false,
 ): Future[void] {.async.} =
   ## Write data to file using direct descriptors. Requires `registerFixedFileSlots`.
-  ## Chains openDirect → writeFixedFile → fsyncFixedFile → closeDirect in a single
+  ## Chains openDirect -> writeFixedFile -> fsyncFixedFile -> closeDirect in a single
   ## submission (1 syscall for data ≤ 4GB).
   ## If dataOnly is true, the post-write fsync uses fdatasync semantics
   ## (only file data is flushed, not non-essential metadata). Ignored if
   ## fsync is false.
-  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  ## If timeoutMs > 0, raises TimeoutError when the deadline passes (a result
+  ## that completed meanwhile is adopted). A timed-out close keeps running in
+  ## the background.
   let deadline =
     if timeoutMs > 0:
       getMonoTime() + initDuration(milliseconds = timeoutMs)
@@ -449,10 +570,12 @@ proc writeFileDirect*(
   let flags = O_WRONLY or O_CREAT or O_TRUNC
   let slot = allocFixedFileSlot(u)
   var slotHasFile = false
+  var closeInFlight: Future[int32]
+    # closeDirect in flight; the slot must not be reused until it settles.
 
   try:
     if data.len <= int(high(uint32)):
-      # Single chain: openDirect → (write →) (fsync →) closeDirect
+      # Single chain: openDirect -> (write ->) (fsync ->) closeDirect
       var dataRef: ref seq[byte]
       if data.len > 0:
         dataRef = new(seq[byte])
@@ -480,18 +603,20 @@ proc writeFileDirect*(
         let writeRes = awaitMaybeTimeout(u, writeFut, deadline, Operation.write)
         raiseOnError(writeRes, Operation.write)
         if writeRes <= 0:
+          closeInFlight = closeFut
           raise newException(IOError, "write stalled: 0 bytes written")
 
       if fsync:
         let fsyncRes = awaitMaybeTimeout(u, fsyncFut, deadline, Operation.fsync)
         raiseOnError(fsyncRes, Operation.fsync)
 
-      let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+      closeInFlight = closeFut
+      let closeRes = await awaitBounded(u, closeFut, deadline, Operation.close)
       if closeRes == 0:
         slotHasFile = false
       raiseOnError(closeRes, Operation.close)
     else:
-      # Multi-write: openDirect (await), loop writes, then (fsync →) closeDirect
+      # Multi-write: openDirect (await), loop writes, then (fsync ->) closeDirect
       let openRes = awaitMaybeTimeout(
         u, u.uringOpenDirect(path, flags.cint, 0o644, slot), deadline, Operation.open
       )
@@ -530,27 +655,40 @@ proc writeFileDirect*(
 
         let fsyncRes = awaitMaybeTimeout(u, fsyncFut, deadline, Operation.fsync)
         raiseOnError(fsyncRes, Operation.fsync)
-        let closeRes = awaitMaybeTimeout(u, closeFut, deadline, Operation.close)
+        closeInFlight = closeFut
+        let closeRes = await awaitBounded(u, closeFut, deadline, Operation.close)
         if closeRes == 0:
           slotHasFile = false
         raiseOnError(closeRes, Operation.close)
       else:
-        let closeRes =
-          awaitMaybeTimeout(u, u.uringCloseDirect(slot), deadline, Operation.close)
+        closeInFlight = u.uringCloseDirect(slot)
+        let closeRes = await awaitBounded(u, closeInFlight, deadline, Operation.close)
         if closeRes == 0:
           slotHasFile = false
         raiseOnError(closeRes, Operation.close)
   finally:
-    if slotHasFile:
-      discard await u.uringCloseDirect(slot)
-    freeFixedFileSlot(u, slot)
+    if closeInFlight != nil and not closeInFlight.finished:
+      # closeDirect still in flight: release the slot when it settles (a second
+      # close would double-close it).
+      releaseSlotOnSettle(u, slot, closeInFlight)
+    elif slotHasFile:
+      let closeFut = u.uringCloseDirect(slot)
+      try:
+        discard await awaitBounded(u, closeFut, deadline, Operation.close)
+      except CatchableError:
+        discard
+      releaseSlotOnSettle(u, slot, closeFut)
+    else:
+      freeFixedFileSlot(u, slot)
 
 proc readFileStringDirect*(
     u: UringFileIO, path: string, timeoutMs: int = 0
 ): Future[string] {.async.} =
   ## Read entire file as string using direct descriptors.
   ## Requires `registerFixedFileSlots`.
-  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  ## If timeoutMs > 0, raises TimeoutError when the deadline passes (a result
+  ## that completed meanwhile is adopted). A timed-out close keeps running in
+  ## the background.
   let bytes = await readFileDirect(u, path, timeoutMs)
   var s = newString(bytes.len)
   if bytes.len > 0:
@@ -568,7 +706,9 @@ proc writeFileStringDirect*(
   ## Write string to file using direct descriptors.
   ## Requires `registerFixedFileSlots`.
   ## If dataOnly is true, the post-write fsync uses fdatasync semantics.
-  ## If timeoutMs > 0, raises TimeoutError if the operation exceeds the deadline.
+  ## If timeoutMs > 0, raises TimeoutError when the deadline passes (a result
+  ## that completed meanwhile is adopted). A timed-out close keeps running in
+  ## the background.
   var bytes = newSeq[byte](data.len)
   if data.len > 0:
     copyMem(addr bytes[0], unsafeAddr data[0], data.len)

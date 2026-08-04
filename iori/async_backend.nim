@@ -31,22 +31,24 @@ when hasChronos:
 
   type BridgeCancelCallback* = proc(arg: pointer) {.gcsafe, raises: [].}
     ## Callback invoked when a bridge future is cancelled via chronos. `arg` is the
-    ## cancelled future itself (chronos passes it as a raw pointer); cast it back to
-    ## `Future[int32]`. Structurally identical to chronos's `CallbackFunc`.
+    ## cancelled future itself (a raw pointer; cast it to `Future[int32]`).
 
   proc setCancelCallback*(fut: Future[int32], cb: BridgeCancelCallback) =
     ## Register `cb` to run if `fut` is cancelled via chronos
-    ## (`cancel`/`cancelAndWait`/`cancelSoon`). `cb` receives `fut` (as a raw
-    ## pointer argument).
-    ##
-    ## Assigns `cb` directly as the chronos cancel callback (no per-future wrapper
-    ## closure): pass a single shared `cb` to avoid allocating one closure per
-    ## operation.
-    ##
-    ## Note: setting a cancel callback does not stop chronos from also moving the
-    ## future to the Cancelled state — `cb` runs first, then chronos finishes the
-    ## future. Must be called before `fut` is finished.
+    ## (`cancel`/`cancelAndWait`/`cancelSoon`); `cb` receives `fut` as a raw
+    ## pointer. `cb` is assigned directly (no wrapper closure) — pass a single
+    ## shared callback to avoid per-op allocation. `cb` runs before chronos moves
+    ## `fut` to Cancelled. Must be called before `fut` is finished.
     fut.cancelCallback = cb
+
+  proc onComplete*(fut: FutureBase, cb: proc() {.gcsafe, raises: [].}) =
+    ## Run `cb` when `fut` finishes (completed, failed or cancelled); if already
+    ## finished, on a later event loop tick.
+    fut.addCallback(
+      proc(udata: pointer) {.gcsafe, raises: [].} =
+        cb(),
+      nil,
+    )
 
   proc registerFdReader*(fd: cint, cb: proc() {.gcsafe, raises: [].}) =
     ## Register a file descriptor for read-readiness notifications on the event loop.
@@ -102,6 +104,14 @@ elif hasAsyncDispatch:
     ## No-op: std/asyncdispatch has no external cancellation callback mechanism,
     ## so bridge futures cannot be cancelled out from under the completion path.
     discard
+
+  proc onComplete*(fut: FutureBase, cb: proc() {.gcsafe, raises: [].}) =
+    ## Run `cb` when `fut` finishes (completed, failed or cancelled); if already
+    ## finished, on a later event loop tick.
+    fut.addCallback(
+      proc() {.closure, gcsafe.} =
+        cb()
+    )
 
   proc registerFdReader*(fd: cint, cb: proc() {.gcsafe, raises: [].}) =
     ## Register a file descriptor for read-readiness notifications on the event loop.
