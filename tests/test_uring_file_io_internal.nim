@@ -8,7 +8,7 @@
 
 import std/[unittest, os, posix, monotimes, times, importutils]
 
-include ../iori/uring_file_io
+import ../iori/uring_file_io {.all.}
 
 privateAccess(UringFileIO)
 
