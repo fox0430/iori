@@ -2074,7 +2074,7 @@ suite "uring_bridge":
 
     waitFor run()
 
-  test "chain: openDirect → readFixedFile → closeDirect (3-op)":
+  test "chain: openDirect -> readFixedFile -> closeDirect (3-op)":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         let path = getTempDir() / "iori_test_chain_3op_direct.txt"
@@ -2122,7 +2122,7 @@ suite "uring_bridge":
 
     waitFor run()
 
-  test "chain: openDirect → writeFixedFile → fsyncFixedFile → closeDirect (4-op)":
+  test "chain: openDirect -> writeFixedFile -> fsyncFixedFile -> closeDirect (4-op)":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         let path = getTempDir() / "iori_test_chain_4op_direct.bin"
@@ -2172,7 +2172,7 @@ suite "uring_bridge":
 
     waitFor run()
 
-  test "chain failure propagation: bad path → openDirect fails → subsequent -ECANCELED":
+  test "chain failure propagation: bad path -> openDirect fails -> subsequent -ECANCELED":
     proc run() {.async.} =
       {.cast(gcsafe).}:
         io.registerFixedFileSlots(1)

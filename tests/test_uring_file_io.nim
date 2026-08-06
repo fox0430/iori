@@ -5,6 +5,10 @@ import std/[unittest, os, posix, importutils, monotimes, times]
 import ../iori/uring_file_io
 import ../iori/uring_raw
 
+when hasChronos:
+  # `io.pending.len` resolves through std/tables (pending is a Table).
+  import std/tables
+
 privateAccess(UringFileIO)
 
 suite "uring_file_io":
@@ -831,3 +835,170 @@ suite "uring_file_io":
         doAssert raised
 
     waitFor run()
+
+  when hasChronos:
+    # Regression tests for external (chronos) cancellation of HIGH-LEVEL futures.
+    # The timeout composition awaits the bridge future directly (never via `or`),
+    # so cancelling a readFile/writeFile future — including with timeoutMs > 0,
+    # which chronos `withTimeout` also exercises via cancelSoon — must propagate
+    # into the kernel op. Without that, the op runs to completion while the
+    # caller believes it was cancelled.
+
+    # Budget for waiting on kernel -ECANCELED CQEs (reaped via the eventfd poll
+    # loop): generous so a loaded CI box does not flake, while a genuinely
+    # dropped cancel still fails the assert because `pending` never drains.
+    const
+      reapIters = 250
+      reapStepMs = 2
+
+    template drainPending() =
+      for _ in 0 ..< reapIters:
+        if io.pending.len == 0:
+          break
+        await sleepMsAsync(reapStepMs)
+      doAssert io.pending.len == 0, "op not reaped: " & $io.pending.len
+
+    proc countOpenFds(): int =
+      ## Count open fds via /proc/self/fd. Linux-only, like the io_uring tests
+      ## themselves. The dir fd walkDir opens for the iteration shows up in the
+      ## listing, but both snapshots include it, so the delta stays exact.
+      var n = 0
+      for _ in walkDir("/proc/self/fd"):
+        inc n
+      n
+
+    test "chronos cancel of writeFile (timeoutMs > 0) reaches the kernel open":
+      ## writeFile on a FIFO with no reader blocks in the open step. Cancelling
+      ## the high-level future must cancel the in-flight open and reap its CQE.
+      let path = getTempDir() / "iori_test_cancel_hl_open"
+      doAssert mkfifo(path.cstring, 0o644) == 0
+      defer:
+        removeFile(path)
+
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          let fut = io.writeFile(path, @[byte 1, 2, 3], timeoutMs = 60_000)
+          await sleepMsAsync(100)
+          doAssert io.pending.len == 1, "open should be in flight"
+
+          await fut.cancelAndWait()
+          doAssert fut.cancelled()
+          drainPending()
+
+      waitFor run()
+
+    test "chronos cancel of writeFile (timeoutMs > 0) reaches the kernel write":
+      ## Open a reader so the FIFO open succeeds, fill the pipe buffer so the
+      ## kernel write must block, then cancel. The write must stop and the
+      ## cleanup close (fd lifecycle) must run, reaping every op.
+      let path = getTempDir() / "iori_test_cancel_hl_write"
+      doAssert mkfifo(path.cstring, 0o644) == 0
+      defer:
+        removeFile(path)
+
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          let readerFd = posix.open(path.cstring, O_RDONLY or O_NONBLOCK)
+          doAssert readerFd >= 0
+          defer:
+            discard posix.close(readerFd)
+
+          # Fill the pipe buffer (64KB) so the next write blocks instead of
+          # short-completing into free buffer space.
+          let fillerFd = posix.open(path.cstring, O_WRONLY or O_NONBLOCK)
+          doAssert fillerFd >= 0
+          defer:
+            discard posix.close(fillerFd)
+          # Pin the pipe capacity to 64KB: the default is PIPE_DEF_BUFFERS(16)
+          # x PAGE_SIZE, so on 16KB/64KB page systems the 128KB write below
+          # would fit and never block, breaking the in-flight assertion.
+          const F_SETPIPE_SZ = 1031
+          doAssert fcntl(fillerFd, F_SETPIPE_SZ, 64 * 1024) >= 64 * 1024
+          var fill = newSeq[byte](64 * 1024)
+          var filled = 0
+          while filled < fill.len:
+            let n = posix.write(fillerFd, addr fill[filled], fill.len - filled)
+            if n <= 0:
+              break
+            filled += n
+          doAssert filled == fill.len
+
+          var bigData = newSeq[byte](128 * 1024)
+          for i in 0 ..< bigData.len:
+            bigData[i] = byte(i mod 256)
+
+          let fdsBaseline = countOpenFds()
+          let fut = io.writeFile(path, bigData, timeoutMs = 60_000, fsync = false)
+          await sleepMsAsync(100)
+          # write + linked close, both submitted
+          doAssert io.pending.len == 2, "write chain should be in flight"
+
+          await fut.cancelAndWait()
+          doAssert fut.cancelled()
+          # The write CQE, the linked close CQE (auto-cancelled by IO_LINK) and
+          # the cleanup close CQE must all be reaped. `pending.len == 0` alone
+          # cannot tell the cleanup close apart (2 -> 0 without it as well), so
+          # the fd count is checked against the pre-writeFile baseline too: a
+          # missing cleanup close would leave the FIFO write end open.
+          drainPending()
+          doAssert countOpenFds() == fdsBaseline, "writeFile fd not closed after cancel"
+
+      waitFor run()
+
+    test "chronos cancel of writeFileDirect (timeoutMs > 0) releases the slot":
+      ## writeFileDirect on a FIFO with no reader blocks in openDirect. Cancelling
+      ## must reap the whole chain and return the fixed file slot to the pool.
+      let path = getTempDir() / "iori_test_cancel_hl_direct"
+      doAssert mkfifo(path.cstring, 0o644) == 0
+      defer:
+        removeFile(path)
+
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          io.registerFixedFileSlots(4)
+          defer:
+            io.unregisterFixedFiles()
+          doAssert io.fixedFileSlotsAvailable == 4
+
+          let fut =
+            io.writeFileDirect(path, @[byte 1, 2, 3], timeoutMs = 60_000, fsync = false)
+          await sleepMsAsync(100)
+          # openDirect + writeFixedFile + closeDirect
+          doAssert io.pending.len == 3, "direct chain should be in flight"
+          doAssert io.fixedFileSlotsAvailable == 3
+
+          await fut.cancelAndWait()
+          doAssert fut.cancelled()
+          drainPending()
+          doAssert io.fixedFileSlotsAvailable == 4, "slot not released"
+
+      waitFor run()
+
+    test "chronos withTimeout on writeFile cancels the kernel op":
+      ## chronos withTimeout cancels the target via cancelSoon on expiry — the
+      ## same external-cancel path, exercised through the std-compatible API.
+      let path = getTempDir() / "iori_test_withtimeout_hl"
+      doAssert mkfifo(path.cstring, 0o644) == 0
+      defer:
+        removeFile(path)
+
+      proc run() {.async.} =
+        {.cast(gcsafe).}:
+          let fut = io.writeFile(path, @[byte 1, 2, 3], timeoutMs = 60_000)
+          await sleepMsAsync(100)
+          doAssert io.pending.len == 1, "open should be in flight"
+
+          let completed = await fut.withTimeout(chronos.milliseconds(50))
+          doAssert not completed
+          drainPending()
+
+      waitFor run()
+
+    # No readFile-cancel regression test: readFile opens O_RDONLY, and an
+    # O_RDONLY open of a FIFO does not block in io_uring (observed on kernel
+    # 7.1.5; only the write end blocks), while statx/read of a FIFO complete
+    # instantly and regular files never block. No readFile phase can be made
+    # to stall deterministically, so any such test would pass even on a
+    # regression that drops the cancel. The composition machinery is covered
+    # by the writeFile tests above and the white-box tests in
+    # test_uring_file_io_internal.nim.

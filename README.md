@@ -7,7 +7,7 @@ Async file I/O library in Nim using io_uring.
 
 ## Requirements
 
-- Nim >= 2.0.2
+- Nim >= 2.0.16
 - Linux 5.6+ (6.1+ recommended)
 
 ## Install
