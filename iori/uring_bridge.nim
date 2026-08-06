@@ -14,6 +14,21 @@ when hasChronos:
   import std/sets
 
 export async_backend
+export uring_raw.Statx
+export uring_raw.StatxTs
+export uring_raw.STATX_TYPE
+export uring_raw.STATX_MODE
+export uring_raw.STATX_NLINK
+export uring_raw.STATX_UID
+export uring_raw.STATX_GID
+export uring_raw.STATX_ATIME
+export uring_raw.STATX_MTIME
+export uring_raw.STATX_CTIME
+export uring_raw.STATX_INO
+export uring_raw.STATX_SIZE
+export uring_raw.STATX_BLOCKS
+export uring_raw.STATX_BASIC_STATS
+export uring_raw.STATX_BTIME
 
 proc eventfd(initval: cuint, flags: cint): cint {.importc, header: "<sys/eventfd.h>".}
 
