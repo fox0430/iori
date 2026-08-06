@@ -272,7 +272,14 @@ proc setupRing*(
     entries: uint32 = 256, flags: uint32 = 0
 ): IoUring {.raises: [OSError].} =
   ## Initialize io_uring: setup ring and mmap 3 regions.
-  ## Raises OSError on failure.
+  ## Raises OSError on failure. IOPOLL and SQPOLL flags are rejected:
+  ## IOPOLL is incompatible with the eventfd notification model, and SQPOLL
+  ## with the SQ tail rollback on submit failure.
+  if (flags and (IORING_SETUP_IOPOLL or IORING_SETUP_SQPOLL)) != 0:
+    raiseOSError(
+      OSErrorCode(EINVAL),
+      "io_uring_setup: IORING_SETUP_IOPOLL/SQPOLL are not supported",
+    )
   var params: IoUringParams
   zeroMem(addr params, sizeof(params))
   params.flags = flags
@@ -374,8 +381,10 @@ proc setupRing*(
 
 proc closeRing*(ring: var IoUring) =
   ## Clean up all ring resources (munmap regions and close fd).
-  ## Safe to call on an already-closed ring (no-op).
-  if ring.ringFd < 0:
+  ## Safe to call on an already-closed or zero-initialized ring (no-op).
+  ## A ring whose fd is 0 (possible when stdin was closed before setup) is
+  ## still released: the zero-initialized case is detected via sqRingPtr.
+  if ring.ringFd <= 0 and ring.sqRingPtr == nil:
     return
 
   # munmap SQEs
@@ -442,6 +451,10 @@ proc submit*(ring: var IoUring, waitNr: uint32 = 0): cint =
   ## Submit pending SQEs to the kernel.
   ## Returns number of SQEs submitted, or negative errno.
   ## When waitNr > 0, waits for at least that many CQEs even if no new SQEs.
+  ## With waitNr > 0 the SQ tail is never rolled back on error: io_uring_enter
+  ## with GETEVENTS consumes SQEs before entering the wait phase, so a failure
+  ## (typically EINTR) there does not guarantee 0 SQEs consumed, and rolling
+  ## back would re-submit already-consumed SQEs and corrupt the ring.
   let tail = ring.sqLocalTail
   let prevTail = atomicLoadAcquire(ring.sqTail)
   let toSubmit = tail - prevTail
@@ -460,12 +473,15 @@ proc submit*(ring: var IoUring, waitNr: uint32 = 0): cint =
   result =
     ioUringEnter(ring.ringFd, cuint(toSubmit), cuint(waitNr), cuint(flags), nil, 0)
 
-  if result < 0 and toSubmit > 0:
-    # io_uring_enter failure with negative return guarantees 0 SQEs consumed.
-    # Roll back so zombie SQEs are invisible to kernel and slots are reusable.
-    # NOTE: Safe only in non-SQPOLL mode (kernel reads SQ ring only during io_uring_enter).
-    atomicStoreRelease(ring.sqTail, prevTail)
-    ring.sqLocalTail = prevTail
+  if result < 0:
+    let err = osLastError()
+    result = -cint(err)
+    if toSubmit > 0 and waitNr == 0:
+      # Without GETEVENTS there is no wait phase, so a negative return means
+      # 0 SQEs consumed. Roll back so zombie SQEs are invisible to the kernel
+      # and slots are reusable.
+      atomicStoreRelease(ring.sqTail, prevTail)
+      ring.sqLocalTail = prevTail
 
 proc peekCqe*(ring: var IoUring): ptr IoUringCqe =
   ## Peek at the next completed CQE. Returns nil if none available.

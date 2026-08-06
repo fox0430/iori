@@ -96,6 +96,75 @@ suite "uring_raw":
     closeRing(ring)
     check ring.ringFd == -1
 
+  test "closeRing on zero-initialized ring does not close stdin":
+    var ring: IoUring
+    # fd 0 (stdin) must keep its state — a zeroed ring has ringFd == 0
+    let fd0State = fcntl(0, F_GETFD)
+    closeRing(ring)
+    check fcntl(0, F_GETFD) == fd0State
+
+  test "setupRing rejects unsupported IOPOLL/SQPOLL flags":
+    for flag in [IORING_SETUP_IOPOLL, IORING_SETUP_SQPOLL]:
+      var rejected = false
+      try:
+        discard setupRing(4, flag)
+      except OSError as e:
+        rejected = true
+        check e.errorCode == int32(posix.EINVAL)
+      check rejected
+
+  test "submit returns negative errno on failure":
+    var ring = setupRing(4)
+    let realFd = ring.ringFd
+    defer:
+      ring.ringFd = realFd
+      closeRing(ring)
+
+    let sqe = getSqe(ring)
+    check sqe != nil
+    sqe.opcode = IORING_OP_NOP
+
+    # Sabotage: point the ring at an invalid fd → EBADF
+    ring.ringFd = -1
+    let ret = submit(ring)
+    check ret == -posix.EBADF
+    # Rollback applies to waitNr == 0: the same slot is reused
+    let sqe2 = getSqe(ring)
+    check sqe2 == sqe
+    # The rolled-back slot is still submittable: restore the fd and complete
+    sqe2.opcode = IORING_OP_NOP
+    sqe2.userData = 7
+    ring.ringFd = realFd
+    let ret2 = submit(ring)
+    check ret2 == 1
+    discard submit(ring, waitNr = 1)
+    let cqe = peekCqe(ring)
+    check cqe != nil
+    check cqe.userData == 7
+    check cqe.res == 0
+    advanceCq(ring)
+
+  test "submit with waitNr > 0 does not roll back SQ tail on failure":
+    var ring = setupRing(4)
+    let realFd = ring.ringFd
+    defer:
+      ring.ringFd = realFd
+      closeRing(ring)
+
+    let sqe1 = getSqe(ring)
+    check sqe1 != nil
+    sqe1.opcode = IORING_OP_NOP
+
+    # Sabotage: invalid fd → EBADF
+    ring.ringFd = -1
+    let ret = submit(ring, waitNr = 1)
+    check ret == -posix.EBADF
+
+    # No rollback: the next getSqe returns a different slot (tail advanced)
+    let sqe2 = getSqe(ring)
+    check sqe2 != nil
+    check sqe2 != sqe1
+
   test "submit with no SQEs and waitNr=0 returns 0":
     var ring = setupRing(4)
     defer:
